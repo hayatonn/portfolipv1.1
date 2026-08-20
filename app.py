@@ -8,6 +8,14 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # ==========================================
+# 0. あなたのスプレッドシートURL設定
+# ==========================================
+# ここに設定したURLから、アプリ起動時に全自動で資産データを読み込みます
+DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSrw_rp39tTo9-P0OIZWvtSjP-YZrof4Pbdyk9spQO6lFSYtNJExbYpliIgE8CNJhbsxXUBXZVRYyUN/pub?output=csv"
+
+
+
+# ==========================================
 # 1. ページ設定 & デザインスタイル
 # ==========================================
 st.set_page_config(
@@ -193,13 +201,10 @@ def fetch_ticker_metadata_and_price(ticker_str):
             
         info = getattr(tk, "info", {})
         if isinstance(info, dict):
-            # 会社名
             if t not in POPULAR_JP_NAMES:
                 name = info.get("shortName") or info.get("longName") or t
-            # セクター
             raw_sec = info.get("sector") or info.get("category") or "その他"
             sector = SECTOR_JP_MAP.get(raw_sec, raw_sec)
-            # 通貨
             if "currency" in info and info["currency"]:
                 curr = info["currency"].upper()
     except Exception:
@@ -218,14 +223,10 @@ def fetch_ticker_metadata_and_price(ticker_str):
 # 3. ポートフォリオ計算ロジック
 # ==========================================
 def calculate_portfolio(df, fx_usd_jpy, fee_rate=0.00495):
-    """
-    ユーザーの入力は ticker, shares, buy_price の3つだけでOK！
-    銘柄名(name), セクター(sector), 通貨(currency), 種類(asset_type)は全自動補完。
-    """
     df = df.copy()
     df.columns = df.columns.str.strip().str.replace("　", "")
     
-    # 必須列
+    # 必須列チェック
     for col in ["ticker", "shares", "buy_price"]:
         if col not in df.columns:
             st.error(f"CSVデータに必要な列 '{col}' が見つかりません。")
@@ -234,11 +235,10 @@ def calculate_portfolio(df, fx_usd_jpy, fee_rate=0.00495):
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0)
     df["buy_price"] = pd.to_numeric(df["buy_price"], errors="coerce").fillna(0)
     
-    # 各ティッカーの情報を自動取得
+    # 自動補完
     meta_list = [fetch_ticker_metadata_and_price(t) for t in df["ticker"]]
     meta_df = pd.DataFrame(meta_list)
     
-    # ユーザーが指定していない列は自動取得値で埋める
     if "name" not in df.columns or df["name"].isnull().all():
         df["name"] = meta_df["name"]
     else:
@@ -298,7 +298,6 @@ def calculate_portfolio(df, fx_usd_jpy, fee_rate=0.00495):
 # 4. サンプルデータ
 # ==========================================
 def get_sample_portfolio():
-    # 3列だけでOK！
     return pd.DataFrame([
         {"ticker": "AAPL", "shares": 25, "buy_price": 165.0},
         {"ticker": "MSFT", "shares": 15, "buy_price": 380.0},
@@ -311,8 +310,19 @@ def get_sample_portfolio():
 
 
 # ==========================================
-# 5. サイドバー
+# 5. サイドバー & データ読込
 # ==========================================
+# Streamlit Secrets または DEFAULT_SPREADSHEET_URL から優先取得
+configured_url = ""
+try:
+    if "SPREADSHEET_URL" in st.secrets:
+        configured_url = st.secrets["SPREADSHEET_URL"]
+except Exception:
+    pass
+
+if not configured_url:
+    configured_url = DEFAULT_SPREADSHEET_URL
+
 with st.sidebar:
     st.markdown("### ⚙️ 設定 & データ連携")
     
@@ -327,9 +337,11 @@ with st.sidebar:
     st.markdown("---")
     
     st.markdown("### 📂 ポートフォリオの読込")
+    
+    # スプレッドシートURLを最優先（初期選択）
     data_source = st.radio(
         "データ取得元を選択",
-        ["📝 サンプルデータ（デモ）", "☁️ Googleスプレッドシート / URL", "📎 CSVファイルをアップロード"],
+        ["☁️ Googleスプレッドシート / URL", "📎 CSVファイルをアップロード", "📝 サンプルデータ（デモ）"],
         index=0
     )
     
@@ -337,20 +349,22 @@ with st.sidebar:
     if data_source == "☁️ Googleスプレッドシート / URL":
         sheet_url = st.text_input(
             "スプレッドシートのCSV公開URL",
+            value=configured_url,
             placeholder="https://docs.google.com/spreadsheets/d/.../pub?output=csv",
             help="スプレッドシートの「ファイル」→「共有」→「ウェブに公開」→「CSV」で取得したURLを入力してください。"
         )
-        if sheet_url:
+        if sheet_url and sheet_url.strip():
             try:
-                res = requests.get(sheet_url, timeout=10)
+                res = requests.get(sheet_url.strip(), timeout=10)
                 res.raise_for_status()
                 df_raw = pd.read_csv(io.StringIO(res.text), encoding="utf-8-sig")
-                st.success("✅ スプレッドシートから読み込みました！")
+                st.success("✅ スプレッドシートから読み込み完了！")
             except Exception as e:
-                st.error(f"読み込み失敗: {e}")
+                st.error(f"スプレッドシートの読み込みに失敗しました: {e}")
+                st.info("URLが正しいか、または「ウェブに公開（CSV形式）」になっているかご確認ください。")
                 df_raw = get_sample_portfolio()
         else:
-            st.info("💡 スプレッドシートURLが未入力のため、現在はサンプルデータを表示しています。")
+            st.info("💡 スプレッドシートURLが未入力のため、現在はサンプルデータを表示しています。URLを入力するか、コードの `DEFAULT_SPREADSHEET_URL` に設定してください。")
             df_raw = get_sample_portfolio()
             
     elif data_source == "📎 CSVファイルをアップロード":
@@ -581,8 +595,12 @@ with tab4:
             return "color: #dc2626; font-weight: 600;"
         return ""
 
-    styled_table = display_df.style.applymap(color_pnl, subset=["買値からの損益 (円)", "損益率 (リターン)"])
+    try:
+        styled_table = display_df.style.map(color_pnl, subset=["買値からの損益 (円)", "損益率 (リターン)"])
+    except AttributeError:
+        styled_table = display_df.style.applymap(color_pnl, subset=["買値からの損益 (円)", "損益率 (リターン)"])
+        
     st.dataframe(styled_table, use_container_width=True, hide_index=True)
 
 st.markdown("---")
-st.caption("💡 銘柄コード（ticker）、保有数（shares）、買値（buy_price）の3つだけ入力すれば、銘柄名・セクター・通貨は全自動取得されます！")
+st.caption("💡 スプレッドシートを更新すれば、この画面にも自動で最新データが反映されます。")
