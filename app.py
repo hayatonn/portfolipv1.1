@@ -10,9 +10,7 @@ from datetime import datetime
 # ==========================================
 # 0. あなたのスプレッドシートURL設定
 # ==========================================
-# ここに設定したURLから、アプリ起動時に全自動で資産データを読み込みます
 DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSrw_rp39tTo9-P0OIZWvtSjP-YZrof4Pbdyk9spQO6lFSYtNJExbYpliIgE8CNJhbsxXUBXZVRYyUN/pub?output=csv"
-
 
 
 # ==========================================
@@ -108,21 +106,8 @@ st.markdown("""
 
 
 # ==========================================
-# 2. 自動取得 & キャッシュ関数群
+# 2. 高速化キャッシュ＆一括データ取得
 # ==========================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_usd_to_jpy():
-    """USD/JPY最新為替レート"""
-    try:
-        ticker = yf.Ticker("USDJPY=X")
-        hist = ticker.history(period="1d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-        return 155.0
-    except Exception:
-        return 155.0
-
-
 SECTOR_JP_MAP = {
     "Technology": "テクノロジー (IT)",
     "Financial Services": "金融",
@@ -140,6 +125,14 @@ SECTOR_JP_MAP = {
 }
 
 POPULAR_JP_NAMES = {
+    "MU": "Micron Technology",
+    "SNDK": "SanDisk",
+    "PLTR": "Palantir Technologies",
+    "MSTR": "MicroStrategy",
+    "HNGE": "Hinge Health",
+    "LPTH": "LightPath Technologies",
+    "FNV": "Franco-Nevada",
+    "CRDO": "Credo Technology",
     "7203.T": "トヨタ自動車",
     "9432.T": "日本電信電話 (NTT)",
     "9984.T": "ソフトバンクグループ",
@@ -164,69 +157,128 @@ POPULAR_JP_NAMES = {
     "QQQ": "ナスダック100 ETF (QQQ)",
 }
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_ticker_metadata_and_price(ticker_str):
-    """ティッカーから価格・名前・セクター・通貨を全自動取得"""
-    t = str(ticker_str).strip()
-    
-    # 現金の場合
-    if "CASH" in t.upper() or t in ["JPY", "USD"]:
-        curr = "JPY" if "JPY" in t.upper() else "USD"
-        name = "日本円 預金" if curr == "JPY" else "米ドル 預金"
-        return {"price": 1.0, "name": name, "sector": "現金・預金", "currency": curr, "asset_type": "cash"}
-        
-    # 暗号資産の場合
-    if t.endswith("-USD") or t in ["BTC", "ETH"]:
-        symbol = t if t.endswith("-USD") else f"{t}-USD"
-        try:
-            tk = yf.Ticker(symbol)
-            hist = tk.history(period="1d")
-            price = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
-            name = POPULAR_JP_NAMES.get(symbol, symbol)
-            return {"price": price, "name": name, "sector": "暗号資産 (Crypto)", "currency": "USD", "asset_type": "crypto"}
-        except Exception:
-            return {"price": 0.0, "name": symbol, "sector": "暗号資産 (Crypto)", "currency": "USD", "asset_type": "crypto"}
+POPULAR_SECTORS = {
+    "MU": "テクノロジー (IT)",
+    "SNDK": "テクノロジー (IT)",
+    "PLTR": "テクノロジー (IT)",
+    "MSTR": "テクノロジー (IT)",
+    "HNGE": "ヘルスケア・医療",
+    "LPTH": "テクノロジー (IT)",
+    "FNV": "素材・貴金属",
+    "CRDO": "テクノロジー (IT)",
+    "AAPL": "テクノロジー (IT)",
+    "MSFT": "テクノロジー (IT)",
+    "NVDA": "テクノロジー (IT)",
+    "GOOGL": "通信・メディア",
+    "AMZN": "一般消費財",
+    "META": "通信・メディア",
+    "TSLA": "一般消費財",
+    "7203.T": "一般消費財 (自動車)",
+    "9432.T": "通信・メディア",
+    "8306.T": "金融",
+}
 
-    # 株式・ETFの場合
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_all_market_data_fast(tickers_tuple):
+    """全銘柄の株価とUSD/JPY為替レートを1回のリクエストで一括爆速取得（高速化の要）"""
+    prices = {}
+    valid_tickers = []
+    
+    # 現金と株式を仕分け
+    for t in tickers_tuple:
+        t_str = str(t).strip().upper()
+        if t_str in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or "CASH" in t_str:
+            prices[str(t).strip()] = 1.0
+        else:
+            valid_tickers.append(str(t).strip())
+            
+    # 為替レート取得用シンボルを追加
+    fetch_list = list(set(valid_tickers + ["USDJPY=X"]))
+    
+    usd_jpy = 155.0
+    if fetch_list:
+        try:
+            # 1回のリクエストですべての銘柄を一括ダウンロード
+            df_hist = yf.download(
+                tickers=" ".join(fetch_list),
+                period="5d",
+                interval="1d",
+                progress=False,
+                threads=True
+            )
+            
+            if not df_hist.empty and "Close" in df_hist:
+                close_df = df_hist["Close"]
+                # 複数銘柄の場合
+                if isinstance(close_df, pd.DataFrame):
+                    for col in close_df.columns:
+                        last_valid = close_df[col].dropna()
+                        if not last_valid.empty:
+                            if col == "USDJPY=X":
+                                usd_jpy = float(last_valid.iloc[-1])
+                            else:
+                                prices[col] = float(last_valid.iloc[-1])
+                # 1銘柄だけの場合
+                elif isinstance(close_df, pd.Series):
+                    last_val = close_df.dropna()
+                    if not last_val.empty:
+                        prices[fetch_list[0]] = float(last_val.iloc[-1])
+        except Exception:
+            pass
+
+    return prices, usd_jpy
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_ticker_meta_info(ticker_str):
+    """銘柄名・セクター・通貨などの静的情報を取得（24時間キャッシュ）"""
+    t = str(ticker_str).strip()
+    t_upper = t.upper()
+    
+    # 現金
+    if t_upper in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or "CASH" in t_upper:
+        curr = "JPY" if "JPY" in t_upper else "USD"
+        name = "日本円 預金" if curr == "JPY" else "米ドル 預金"
+        return {"name": name, "sector": "現金・預金", "currency": curr, "asset_type": "cash"}
+        
+    # 暗号資産
+    if t.endswith("-USD") or t_upper in ["BTC", "ETH"]:
+        symbol = t if t.endswith("-USD") else f"{t}-USD"
+        name = POPULAR_JP_NAMES.get(symbol, symbol)
+        return {"name": name, "sector": "暗号資産 (Crypto)", "currency": "USD", "asset_type": "crypto"}
+
+    # 株式
     curr = "JPY" if t.endswith(".T") else "USD"
     name = POPULAR_JP_NAMES.get(t, t)
-    sector = "その他 / 不明"
-    price = None
-    
-    try:
-        tk = yf.Ticker(t)
-        hist = tk.history(period="5d")
-        if not hist.empty:
-            price = float(hist["Close"].dropna().iloc[-1])
+    sector = POPULAR_SECTORS.get(t, "その他")
+
+    # 辞書にない場合のみ yfinance の fast_info を確認
+    if t not in POPULAR_JP_NAMES or t not in POPULAR_SECTORS:
+        try:
+            tk = yf.Ticker(t)
+            info = getattr(tk, "info", {})
+            if isinstance(info, dict):
+                if t not in POPULAR_JP_NAMES:
+                    name = info.get("shortName") or info.get("longName") or t
+                if t not in POPULAR_SECTORS:
+                    raw_sec = info.get("sector") or info.get("category") or "その他"
+                    sector = SECTOR_JP_MAP.get(raw_sec, raw_sec)
+                if "currency" in info and info["currency"]:
+                    curr = info["currency"].upper()
+        except Exception:
+            pass
             
-        info = getattr(tk, "info", {})
-        if isinstance(info, dict):
-            if t not in POPULAR_JP_NAMES:
-                name = info.get("shortName") or info.get("longName") or t
-            raw_sec = info.get("sector") or info.get("category") or "その他"
-            sector = SECTOR_JP_MAP.get(raw_sec, raw_sec)
-            if "currency" in info and info["currency"]:
-                curr = info["currency"].upper()
-    except Exception:
-        pass
-        
-    return {
-        "price": price,
-        "name": name,
-        "sector": sector,
-        "currency": curr,
-        "asset_type": "stock"
-    }
+    return {"name": name, "sector": sector, "currency": curr, "asset_type": "stock"}
 
 
 # ==========================================
-# 3. ポートフォリオ計算ロジック
+# 3. ポートフォリオ計算ロジック（高速版）
 # ==========================================
-def calculate_portfolio(df, fx_usd_jpy, fee_rate=0.00495):
+def calculate_portfolio_fast(df, fx_usd_jpy, fee_rate=0.00495):
     df = df.copy()
     df.columns = df.columns.str.strip().str.replace("　", "")
     
-    # 必須列チェック
     for col in ["ticker", "shares", "buy_price"]:
         if col not in df.columns:
             st.error(f"CSVデータに必要な列 '{col}' が見つかりません。")
@@ -235,9 +287,13 @@ def calculate_portfolio(df, fx_usd_jpy, fee_rate=0.00495):
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0)
     df["buy_price"] = pd.to_numeric(df["buy_price"], errors="coerce").fillna(0)
     
-    # 自動補完
-    meta_list = [fetch_ticker_metadata_and_price(t) for t in df["ticker"]]
-    meta_df = pd.DataFrame(meta_list)
+    # 銘柄リストから一括で価格取得
+    unique_tickers = tuple(df["ticker"].dropna().unique())
+    prices, _ = fetch_all_market_data_fast(unique_tickers)
+    
+    # 静的メタデータ（名前・セクター）を割り当て
+    meta_records = [get_ticker_meta_info(t) for t in df["ticker"]]
+    meta_df = pd.DataFrame(meta_records)
     
     if "name" not in df.columns or df["name"].isnull().all():
         df["name"] = meta_df["name"]
@@ -259,7 +315,8 @@ def calculate_portfolio(df, fx_usd_jpy, fee_rate=0.00495):
     else:
         df["asset_type"] = df["asset_type"].fillna(meta_df["asset_type"])
         
-    df["current_price"] = meta_df["price"].fillna(df["buy_price"])
+    # 現在価格
+    df["current_price"] = df["ticker"].map(prices).fillna(df["buy_price"])
     
     # 為替
     fx_map = {"USD": fx_usd_jpy, "JPY": 1.0}
@@ -312,7 +369,6 @@ def get_sample_portfolio():
 # ==========================================
 # 5. サイドバー & データ読込
 # ==========================================
-# Streamlit Secrets または DEFAULT_SPREADSHEET_URL から優先取得
 configured_url = ""
 try:
     if "SPREADSHEET_URL" in st.secrets:
@@ -330,15 +386,14 @@ with st.sidebar:
     
     st.markdown("---")
     
-    usd_jpy_rate = get_usd_to_jpy()
+    # 初期為替レート取得
+    _, default_fx = fetch_all_market_data_fast(("USDJPY=X",))
     st.markdown(f"**💱 為替レート (USD/JPY)**")
-    fx_input = st.number_input("為替レート (円/ドル)", value=float(usd_jpy_rate), step=0.5, format="%.2f")
+    fx_input = st.number_input("為替レート (円/ドル)", value=float(default_fx), step=0.5, format="%.2f")
     
     st.markdown("---")
     
     st.markdown("### 📂 ポートフォリオの読込")
-    
-    # スプレッドシートURLを最優先（初期選択）
     data_source = st.radio(
         "データ取得元を選択",
         ["☁️ Googleスプレッドシート / URL", "📎 CSVファイルをアップロード", "📝 サンプルデータ（デモ）"],
@@ -354,7 +409,6 @@ with st.sidebar:
             help="スプレッドシートの「ファイル」→「共有」→「ウェブに公開」→「CSV」で取得したURLを入力してください。"
         )
         
-        # 即時更新ボタン
         if st.button("🔄 スプレッドシートの最新データを再取得", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
@@ -362,7 +416,6 @@ with st.sidebar:
         if sheet_url and sheet_url.strip():
             try:
                 clean_url = sheet_url.strip()
-                # pubhtml や edit 形式のURLを自動でCSV出力形式に変換
                 if "/pubhtml" in clean_url:
                     clean_url = clean_url.replace("/pubhtml", "/pub?output=csv")
                 elif "/edit" in clean_url:
@@ -374,13 +427,11 @@ with st.sidebar:
                 res = requests.get(busted_url, headers=headers, timeout=10)
                 res.raise_for_status()
                 df_raw = pd.read_csv(io.StringIO(res.text), encoding="utf-8-sig")
-                st.success("✅ スプレッドシートから最新データを読み込みました！")
+                st.success("✅ 最新データを読み込みました！")
             except Exception as e:
                 st.error(f"スプレッドシートの読み込みに失敗しました: {e}")
-                st.info("URLが正しいか、または「ウェブに公開（CSV形式）」になっているかご確認ください。")
                 df_raw = get_sample_portfolio()
         else:
-            st.info("💡 スプレッドシートURLが未入力のため、現在はサンプルデータを表示しています。URLを入力するか、コードの `DEFAULT_SPREADSHEET_URL` に設定してください。")
             df_raw = get_sample_portfolio()
             
     elif data_source == "📎 CSVファイルをアップロード":
@@ -406,9 +457,8 @@ with h_col2:
         st.cache_data.clear()
         st.rerun()
 
-
-# 計算
-df_portfolio = calculate_portfolio(df_raw, fx_usd_jpy=fx_input)
+# 高速計算
+df_portfolio = calculate_portfolio_fast(df_raw, fx_usd_jpy=fx_input)
 
 if df_portfolio.empty:
     st.warning("表示できるデータがありません。")
