@@ -19,7 +19,7 @@ DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSrw_
 # 1. ページ設定 & デザインスタイル
 # ==========================================
 st.set_page_config(
-    page_title="家族で見る資産管理ポートフォリオ",
+    page_title="H.Tのポートフォリオ",
     page_icon="🏡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -353,12 +353,28 @@ with st.sidebar:
             placeholder="https://docs.google.com/spreadsheets/d/.../pub?output=csv",
             help="スプレッドシートの「ファイル」→「共有」→「ウェブに公開」→「CSV」で取得したURLを入力してください。"
         )
+        
+        # 即時更新ボタン
+        if st.button("🔄 スプレッドシートの最新データを再取得", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+            
         if sheet_url and sheet_url.strip():
             try:
-                res = requests.get(sheet_url.strip(), timeout=10)
+                clean_url = sheet_url.strip()
+                # pubhtml や edit 形式のURLを自動でCSV出力形式に変換
+                if "/pubhtml" in clean_url:
+                    clean_url = clean_url.replace("/pubhtml", "/pub?output=csv")
+                elif "/edit" in clean_url:
+                    clean_url = clean_url.split("/edit")[0] + "/export?format=csv"
+
+                sep = "&" if "?" in clean_url else "?"
+                busted_url = f"{clean_url}{sep}_t={int(datetime.now().timestamp())}"
+                headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+                res = requests.get(busted_url, headers=headers, timeout=10)
                 res.raise_for_status()
                 df_raw = pd.read_csv(io.StringIO(res.text), encoding="utf-8-sig")
-                st.success("✅ スプレッドシートから読み込み完了！")
+                st.success("✅ スプレッドシートから最新データを読み込みました！")
             except Exception as e:
                 st.error(f"スプレッドシートの読み込みに失敗しました: {e}")
                 st.info("URLが正しいか、または「ウェブに公開（CSV形式）」になっているかご確認ください。")
@@ -380,8 +396,16 @@ with st.sidebar:
 # ==========================================
 # 6. メイン画面
 # ==========================================
-st.title("🏡 我が家の資産管理ポートフォリオ")
-st.caption(f"最終更新: {datetime.now().strftime('%Y年%m月%d日 %H:%M')} | 為替: 1 USD = {fx_input:.2f} 円")
+h_col1, h_col2 = st.columns([3, 1])
+with h_col1:
+    st.title("🏡 H.Tのポートフォリオ")
+    st.caption(f"最終更新: {datetime.now().strftime('%Y年%m月%d日 %H:%M')} | 為替: 1 USD = {fx_input:.2f} 円")
+with h_col2:
+    st.markdown("<div style='margin-top: 18px;'></div>", unsafe_allow_html=True)
+    if st.button("🔄 最新データに更新", use_container_width=True, help="スプレッドシートや株価の最新データを今すぐ再取得します"):
+        st.cache_data.clear()
+        st.rerun()
+
 
 # 計算
 df_portfolio = calculate_portfolio(df_raw, fx_usd_jpy=fx_input)
