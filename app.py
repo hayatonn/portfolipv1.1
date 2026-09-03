@@ -362,9 +362,17 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
     start_date = df_tx["date"].min()
     today = pd.Timestamp(date.today())
     
-    # 銘柄リスト（現金以外）
+    def is_jpy_cash_ticker(tk_str):
+        tu = str(tk_str).strip().upper()
+        return tu in ["JPY", "JPY_CASH", "CASH", "円", "日本円"] or "JPY" in tu
+
+    def is_usd_cash_ticker(tk_str):
+        tu = str(tk_str).strip().upper()
+        return tu in ["USD", "USD_CASH", "ドル", "米ドル"] or "USD" in tu
+
+    # 銘柄リスト（現金は絶対に除外）
     all_tickers = df_tx["ticker"].unique()
-    stock_tickers = [t for t in all_tickers if t not in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] and not t.endswith("_CASH")]
+    stock_tickers = [t for t in all_tickers if not is_jpy_cash_ticker(t) and not is_usd_cash_ticker(t)]
     
     fetch_list = list(set(stock_tickers + ["USDJPY=X"]))
     hist_prices = pd.DataFrame()
@@ -435,30 +443,53 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                 elif act in ["DIVIDEND", "配当", "配当金", "利息"]:
                     act = "DIVIDEND"
                     
-                is_usd = (t in ["USD", "USD_CASH"])
+                is_jpy_c = is_jpy_cash_ticker(t)
+                is_usd_c = is_usd_cash_ticker(t)
                 
-                if act == "DEPOSIT":
-                    if is_usd:
-                        amt_usd = sh * pr
-                        cash_usd += amt_usd
-                        net_deposit_jpy += amt_usd * fx_now
-                    else:
-                        amt_jpy = sh * pr
+                # --- 現金銘柄（JPY/USD）の処理 ---
+                if is_jpy_c:
+                    amt_jpy = sh * pr
+                    if act in ["DEPOSIT", "BUY"]:
                         cash_jpy += amt_jpy
                         net_deposit_jpy += amt_jpy
-                        
-                elif act == "WITHDRAW":
-                    if is_usd:
-                        amt_usd = sh * pr
-                        cash_usd = max(0.0, cash_usd - amt_usd)
-                        net_deposit_jpy -= amt_usd * fx_now
-                    else:
-                        amt_jpy = sh * pr
+                    elif act in ["WITHDRAW", "SELL"]:
                         cash_jpy = max(0.0, cash_jpy - amt_jpy)
                         net_deposit_jpy -= amt_jpy
+                    continue
+                elif is_usd_c:
+                    amt_usd = sh * pr
+                    if act in ["DEPOSIT", "BUY"]:
+                        cash_usd += amt_usd
+                        net_deposit_jpy += amt_usd * fx_now
+                    elif act in ["WITHDRAW", "SELL"]:
+                        cash_usd = max(0.0, cash_usd - amt_usd)
+                        net_deposit_jpy -= amt_usd * fx_now
+                    continue
+
+                # --- 株式・暗号資産の処理 ---
+                if act == "DEPOSIT":
+                    # 株式の入庫など
+                    curr = "JPY" if t.endswith(".T") else "USD"
+                    cost_local = sh * pr
+                    if t not in holdings:
+                        holdings[t] = {"shares": 0.0, "cost_basis_local": 0.0, "currency": curr}
+                    holdings[t]["shares"] += sh
+                    holdings[t]["cost_basis_local"] += cost_local
+                    net_deposit_jpy += cost_local * (fx_now if curr == "USD" else 1.0)
+                        
+                elif act == "WITHDRAW":
+                    curr = "JPY" if t.endswith(".T") else "USD"
+                    if t in holdings and holdings[t]["shares"] > 0:
+                        prev_sh = holdings[t]["shares"]
+                        prev_cost = holdings[t]["cost_basis_local"]
+                        sold_fraction = min(1.0, sh / prev_sh)
+                        sold_cost = prev_cost * sold_fraction
+                        holdings[t]["shares"] = max(0.0, prev_sh - sh)
+                        holdings[t]["cost_basis_local"] = max(0.0, prev_cost - sold_cost)
+                        net_deposit_jpy -= sold_cost * (fx_now if curr == "USD" else 1.0)
                         
                 elif act == "BUY":
-                    curr = holdings.get(t, {}).get("currency", "JPY" if t.endswith(".T") else "USD")
+                    curr = "JPY" if t.endswith(".T") else "USD"
                     cost_local = sh * pr + fee
                     
                     if curr == "USD":
@@ -488,7 +519,7 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                     holdings[t]["cost_basis_local"] += cost_local
                     
                 elif act == "SELL":
-                    curr = holdings.get(t, {}).get("currency", "JPY" if t.endswith(".T") else "USD")
+                    curr = "JPY" if t.endswith(".T") else "USD"
                     revenue_local = sh * pr - fee
                     
                     if t in holdings and holdings[t]["shares"] > 0:
@@ -509,7 +540,7 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                         holdings[t]["cost_basis_local"] = max(0.0, prev_cost - sold_cost)
                         
                 elif act == "DIVIDEND":
-                    curr = "USD" if (t in ["USD", "USD_CASH"] or not t.endswith(".T")) else "JPY"
+                    curr = "JPY" if t.endswith(".T") else "USD"
                     amt = sh * pr
                     if curr == "USD":
                         cash_usd += amt
@@ -518,9 +549,10 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                         cash_jpy += amt
                         realized_pnl_jpy += amt
 
-        # 本日の評価額
+        # 本日の評価額と各銘柄の含み損益率(%)
         equity_val_jpy = 0.0
         stock_values = {}
+        stock_pnl_pcts = {}
         for t, h in holdings.items():
             sh = h["shares"]
             if sh > 0:
@@ -531,10 +563,16 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                 if np.isnan(p) or p <= 0:
                     p = h["cost_basis_local"] / sh if sh > 0 else 0.0
                 val_jpy = sh * p * (fx_now if curr == "USD" else 1.0)
+                cost_jpy = h["cost_basis_local"] * (fx_now if curr == "USD" else 1.0)
+                
                 equity_val_jpy += val_jpy
                 stock_values[t] = val_jpy
+                
+                pnl_pct_val = ((val_jpy - cost_jpy) / cost_jpy * 100) if cost_jpy > 0 else 0.0
+                stock_pnl_pcts[f"{t}_pnl_pct"] = pnl_pct_val
             else:
                 stock_values[t] = 0.0
+                stock_pnl_pcts[f"{t}_pnl_pct"] = np.nan
                 
         total_cash_jpy = cash_jpy + (cash_usd * fx_now)
         total_val_jpy = total_cash_jpy + equity_val_jpy
@@ -551,7 +589,8 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
             "pnl_pct": pnl_pct,
             "realized_pnl_jpy": realized_pnl_jpy,
             "usd_jpy": fx_now,
-            **stock_values
+            **stock_values,
+            **stock_pnl_pcts
         })
         
     df_history = pd.DataFrame(daily_records)
@@ -616,14 +655,17 @@ def calculate_holdings_history_fast(df_portfolio, fx_usd_jpy):
         fx_now = float(fx_series.loc[dt]) if dt in fx_series.index else fx_usd_jpy
         equity_val = 0.0
         stock_values = {}
+        stock_pnl_pcts = {}
         for _, row in df_portfolio[df_portfolio["asset_type"] != "cash"].iterrows():
             t = row["ticker"]
             sh = row["shares"]
             curr = row["currency"]
             p = float(full_prices.loc[dt, t]) if (t in full_prices.columns and dt in full_prices.index) else row["current_price"]
             v = sh * p * (fx_now if curr == "USD" else 1.0)
+            c = row["cost_basis_jpy"]
             equity_val += v
             stock_values[t] = v
+            stock_pnl_pcts[f"{t}_pnl_pct"] = ((v - c) / c * 100) if c > 0 else 0.0
             
         tot = cash_val + equity_val
         pnl = tot - total_cost
@@ -639,7 +681,8 @@ def calculate_holdings_history_fast(df_portfolio, fx_usd_jpy):
             "pnl_pct": pnl_pct,
             "realized_pnl_jpy": 0.0,
             "usd_jpy": fx_now,
-            **stock_values
+            **stock_values,
+            **stock_pnl_pcts
         })
     return pd.DataFrame(daily_records)
 
@@ -904,8 +947,6 @@ st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 # ==========================================
 tab_titles = [
     "📈 【資産推移・パフォーマンス】",
-    "📊 【買値 vs いまの価値】", 
-    "🏆 【銘柄別 利益ランキング】", 
     "🥧 【資産・セクター配分】", 
     "📋 【保有銘柄 一覧表】"
 ]
@@ -922,12 +963,21 @@ with tabs[0]:
     st.caption("過去から現在までの総資産評価額の推移と、投じた元本の軌跡です。")
     
     if not df_history.empty:
-        period_choice = st.radio(
-            "表示期間",
-            ["全期間 (ALL)", "1年 (1Y)", "6ヶ月 (6M)", "3ヶ月 (3M)", "1ヶ月 (1M)", "年初来 (YTD)"],
-            horizontal=True,
-            index=0
-        )
+        c_top1, c_top2 = st.columns([3, 1])
+        with c_top1:
+            period_choice = st.radio(
+                "表示期間",
+                ["全期間 (ALL)", "1年 (1Y)", "6ヶ月 (6M)", "3ヶ月 (3M)", "1ヶ月 (1M)", "年初来 (YTD)"],
+                horizontal=True,
+                index=0
+            )
+        with c_top2:
+            main_chart_unit = st.radio(
+                "単位",
+                ["💰 金額 (円)", "📈 損益率 (%)"],
+                horizontal=True,
+                index=0
+            )
             
         latest_dt = df_history["date"].max()
         if period_choice == "1ヶ月 (1M)":
@@ -947,158 +997,207 @@ with tabs[0]:
         
         fig_timeline = go.Figure()
         
-        # 投資元本ライン
-        fig_timeline.add_trace(go.Scatter(
-            x=view_hist["date"],
-            y=view_hist["net_deposit_jpy"] if not mask_mode else [100] * len(view_hist),
-            name="投資元本 (投入資金)",
-            mode="lines",
-            line=dict(color="#94a3b8", width=2, dash="dash"),
-            hovertemplate="<b>%{x|%Y/%m/%d}</b><br>投資元本: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
-        ))
-        
-        # 総資産額ライン
-        fig_timeline.add_trace(go.Scatter(
-            x=view_hist["date"],
-            y=view_hist["total_value_jpy"] if not mask_mode else [100 * (1 + row.pnl_pct/100) for _, row in view_hist.iterrows()],
-            name="総資産評価額",
-            mode="lines",
-            line=dict(color="#10b981", width=3),
-            fill="tonexty" if not mask_mode else None,
-            fillcolor="rgba(16, 185, 129, 0.08)",
-            hovertemplate="<b>%{x|%Y/%m/%d}</b><br>総資産額: " + ("¥%{y:,.0f}" if not mask_mode else "相対指数") + "<extra></extra>"
-        ))
+        if main_chart_unit == "💰 金額 (円)":
+            # 投資元本ライン
+            fig_timeline.add_trace(go.Scatter(
+                x=view_hist["date"],
+                y=view_hist["net_deposit_jpy"] if not mask_mode else [100] * len(view_hist),
+                name="投資元本 (投入資金)",
+                mode="lines",
+                line=dict(color="#94a3b8", width=2, dash="dash"),
+                hovertemplate="<b>%{x|%Y/%m/%d}</b><br>投資元本: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
+            ))
+            
+            # 総資産額ライン
+            fig_timeline.add_trace(go.Scatter(
+                x=view_hist["date"],
+                y=view_hist["total_value_jpy"] if not mask_mode else [100 * (1 + row.pnl_pct/100) for _, row in view_hist.iterrows()],
+                name="総資産評価額",
+                mode="lines",
+                line=dict(color="#10b981", width=3),
+                fill="tonexty" if not mask_mode else None,
+                fillcolor="rgba(16, 185, 129, 0.08)",
+                hovertemplate="<b>%{x|%Y/%m/%d}</b><br>総資産額: " + ("¥%{y:,.0f}" if not mask_mode else "相対指数") + "<extra></extra>"
+            ))
+            y_main_title = "金額 (円)" if not mask_mode else "パフォーマンス指数"
+        else: # 損益率 (%)
+            fig_timeline.add_hline(y=0, line_dash="dash", line_color="#94a3b8", line_width=1.5)
+            fig_timeline.add_trace(go.Scatter(
+                x=view_hist["date"],
+                y=view_hist["pnl_pct"],
+                name="ポートフォリオ全体の損益率 (%)",
+                mode="lines",
+                line=dict(color="#10b981", width=3),
+                fill="tozeroy",
+                fillcolor="rgba(16, 185, 129, 0.08)",
+                hovertemplate="<b>%{x|%Y/%m/%d}</b><br>全体損益率: %{y:+.2f}%<extra></extra>"
+            ))
+            y_main_title = "含み損益率 (%)"
         
         fig_timeline.update_layout(
             hovermode="x unified",
             margin=dict(l=20, r=20, t=30, b=30),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            yaxis_title="金額 (円)" if not mask_mode else "パフォーマンス指数",
+            yaxis_title=y_main_title,
             height=430,
             xaxis=dict(showgrid=True, gridcolor="#f1f5f9"),
             yaxis=dict(showgrid=True, gridcolor="#f1f5f9")
         )
         st.plotly_chart(fig_timeline, use_container_width=True)
         
-        # 資産内訳推移（積み上げエリアチャート）
-        st.markdown("##### 🧱 資産内訳のボリューム推移")
+        # 2. 資産内訳推移（見やすさ抜群のマルチモード＆現金フィルタ）
+        st.markdown("---")
+        st.markdown("##### 🧱 銘柄別・資産内訳の推移")
         
+        c_ctrl1, c_ctrl2 = st.columns([3, 1])
+        with c_ctrl1:
+            chart_type = st.radio(
+                "表示モード",
+                ["📈 銘柄別の含み損益率 (%)", "💰 銘柄別の評価額 (円)", "🧱 全体の積み上げ (面グラフ)", "🥧 構成比率 (100%比率)"],
+                horizontal=True,
+                index=0,
+                help="「銘柄別の含み損益率 (%)」を選ぶと、各株が買値から何％プラス/マイナスになっているかの推移を比較できます！"
+            )
+        with c_ctrl2:
+            include_cash = st.toggle("💵 現金・預金を含める", value=False, help="現金を外すと、株式・暗号資産の増減が大きく拡大されて見やすくなります。")
+            
         stock_cols = [c for c in view_hist.columns if c not in [
             "date", "total_value_jpy", "net_deposit_jpy", "cash_jpy", "equity_jpy",
             "unrealized_pnl_jpy", "pnl_pct", "realized_pnl_jpy", "usd_jpy"
-        ]]
+        ] and not c.endswith("_pnl_pct")]
         
-        fig_area = go.Figure()
-        if (view_hist["cash_jpy"] > 0).any():
-            fig_area.add_trace(go.Scatter(
-                x=view_hist["date"],
-                y=view_hist["cash_jpy"] if not mask_mode else [1] * len(view_hist),
-                name="現金・預金",
-                mode="lines",
-                stackgroup="one",
-                line=dict(width=0.5, color="#cbd5e1"),
-                fillcolor="#e2e8f0",
-                hovertemplate="現金: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
-            ))
+        fig_sub = go.Figure()
         
-        colors_palette = px.colors.qualitative.Pastel + px.colors.qualitative.Safe
-        for idx, s_col in enumerate(stock_cols):
-            if (view_hist[s_col] > 0).any():
-                s_name = POPULAR_JP_NAMES.get(s_col, s_col)
-                col_c = colors_palette[idx % len(colors_palette)]
-                fig_area.add_trace(go.Scatter(
+        modern_colors = [
+            "#3b82f6", "#10b981", "#f59e0b", "#ec4899", "#8b5cf6",
+            "#06b6d4", "#f97316", "#14b8a6", "#6366f1", "#84cc16",
+            "#a855f7", "#e11d48", "#0284c7", "#d97706", "#475569"
+        ]
+        
+        # 損益率（%）モードの時はゼロラインを追加
+        if chart_type == "📈 銘柄別の含み損益率 (%)":
+            fig_sub.add_hline(y=0, line_dash="dash", line_color="#94a3b8", line_width=1.5)
+
+        # 現金の追加
+        if include_cash and (view_hist["cash_jpy"] > 0).any():
+            if chart_type == "📈 銘柄別の含み損益率 (%)":
+                fig_sub.add_trace(go.Scatter(
                     x=view_hist["date"],
-                    y=view_hist[s_col] if not mask_mode else [1] * len(view_hist),
-                    name=s_name,
+                    y=[0.0] * len(view_hist),
+                    name="💵 現金・預金 (±0%)",
+                    mode="lines",
+                    line=dict(width=1.5, color="#94a3b8", dash="dot"),
+                    hovertemplate="現金: ±0.0%<extra></extra>"
+                ))
+            elif chart_type == "💰 銘柄別の評価額 (円)":
+                fig_sub.add_trace(go.Scatter(
+                    x=view_hist["date"],
+                    y=view_hist["cash_jpy"] if not mask_mode else [1] * len(view_hist),
+                    name="💵 現金・預金",
+                    mode="lines",
+                    line=dict(width=2, color="#94a3b8", dash="dot"),
+                    hovertemplate="現金: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
+                ))
+            elif chart_type == "🧱 全体の積み上げ (面グラフ)":
+                fig_sub.add_trace(go.Scatter(
+                    x=view_hist["date"],
+                    y=view_hist["cash_jpy"] if not mask_mode else [1] * len(view_hist),
+                    name="💵 現金・預金",
                     mode="lines",
                     stackgroup="one",
-                    line=dict(width=0.5),
-                    hovertemplate=f"{s_name}: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
+                    line=dict(width=0.5, color="#cbd5e1"),
+                    fillcolor="rgba(203, 213, 225, 0.4)",
+                    hovertemplate="現金: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
                 ))
+            else: # 100%比率
+                denom = view_hist["total_value_jpy"].replace(0, 1)
+                fig_sub.add_trace(go.Scatter(
+                    x=view_hist["date"],
+                    y=(view_hist["cash_jpy"] / denom * 100),
+                    name="💵 現金・預金",
+                    mode="lines",
+                    stackgroup="one",
+                    line=dict(width=0.5, color="#cbd5e1"),
+                    fillcolor="rgba(203, 213, 225, 0.4)",
+                    hovertemplate="現金: %{y:.1f}%<extra></extra>"
+                ))
+
+        # 各銘柄の追加
+        for idx, s_col in enumerate(stock_cols):
+            # 保有期間があるかチェック
+            if (view_hist[s_col] > 0).any() or (f"{s_col}_pnl_pct" in view_hist and not view_hist[f"{s_col}_pnl_pct"].isna().all()):
+                s_name = POPULAR_JP_NAMES.get(s_col, s_col)
+                line_color = modern_colors[idx % len(modern_colors)]
                 
-        fig_area.update_layout(
+                if chart_type == "📈 銘柄別の含み損益率 (%)":
+                    pnl_series = view_hist.get(f"{s_col}_pnl_pct", pd.Series(index=view_hist.index))
+                    fig_sub.add_trace(go.Scatter(
+                        x=view_hist["date"],
+                        y=pnl_series,
+                        name=s_name,
+                        mode="lines",
+                        connectgaps=False, # 保有していない期間は線を途切れさせる
+                        line=dict(width=2.5, color=line_color),
+                        hovertemplate=f"<b>{s_name}</b>: %{{y:+.2f}}%<extra></extra>"
+                    ))
+                elif chart_type == "💰 銘柄別の評価額 (円)":
+                    val_series = view_hist[s_col].replace(0, np.nan)
+                    fig_sub.add_trace(go.Scatter(
+                        x=view_hist["date"],
+                        y=val_series if not mask_mode else [1] * len(view_hist),
+                        name=s_name,
+                        mode="lines",
+                        connectgaps=False,
+                        line=dict(width=2.5, color=line_color),
+                        hovertemplate=f"<b>{s_name}</b>: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
+                    ))
+                elif chart_type == "🧱 全体の積み上げ (面グラフ)":
+                    fig_sub.add_trace(go.Scatter(
+                        x=view_hist["date"],
+                        y=view_hist[s_col] if not mask_mode else [1] * len(view_hist),
+                        name=s_name,
+                        mode="lines",
+                        stackgroup="one",
+                        line=dict(width=0.5, color=line_color),
+                        hovertemplate=f"<b>{s_name}</b>: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
+                    ))
+                else: # 100%比率
+                    denom = (view_hist["total_value_jpy"] if include_cash else view_hist["equity_jpy"]).replace(0, 1)
+                    fig_sub.add_trace(go.Scatter(
+                        x=view_hist["date"],
+                        y=(view_hist[s_col] / denom * 100),
+                        name=s_name,
+                        mode="lines",
+                        stackgroup="one",
+                        line=dict(width=0.5, color=line_color),
+                        hovertemplate=f"<b>{s_name}</b>: %{{y:.1f}}%<extra></extra>"
+                    ))
+                
+        if chart_type == "📈 銘柄別の含み損益率 (%)":
+            y_title = "買値からの含み損益率 (%)"
+        elif chart_type == "🥧 構成比率 (100%比率)":
+            y_title = "構成比率 (%)"
+        else:
+            y_title = "評価額 (円)" if not mask_mode else "相対比率"
+            
+        fig_sub.update_layout(
             hovermode="x unified",
             margin=dict(l=20, r=20, t=30, b=30),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            yaxis_title="評価額 (円)" if not mask_mode else "構成比",
-            height=370,
+            yaxis_title=y_title,
+            height=430,
             xaxis=dict(showgrid=True, gridcolor="#f1f5f9"),
             yaxis=dict(showgrid=True, gridcolor="#f1f5f9")
         )
-        st.plotly_chart(fig_area, use_container_width=True)
+        st.plotly_chart(fig_sub, use_container_width=True)
         
     else:
         st.info("資産推移データがありません。")
 
 # ----------------------------------------------------
-# TAB 2: 買値 vs いまの価値
+# TAB 2: 資産・セクター配分
 # ----------------------------------------------------
 with tabs[1]:
-    st.subheader("銘柄ごとの「買値」と「現在の価値」の比較")
-    
-    plot_df = df_portfolio[df_portfolio["asset_type"] != "cash"].copy()
-    if not plot_df.empty:
-        plot_df = plot_df.sort_values("market_value_jpy", ascending=False)
-        
-        fig_bar = go.Figure()
-        fig_bar.add_trace(go.Bar(
-            x=plot_df["name"],
-            y=plot_df["cost_basis_jpy"] if not mask_mode else [1] * len(plot_df),
-            name=f"投資元本 (買値+手数料 0.4905%)",
-            marker_color="#94a3b8",
-            hovertemplate="<b>%{x}</b><br>投資元本: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
-        ))
-        fig_bar.add_trace(go.Bar(
-            x=plot_df["name"],
-            y=plot_df["market_value_jpy"] if not mask_mode else [1 * (1 + row.pnl_pct/100) for _, row in plot_df.iterrows()],
-            name="現在の評価額",
-            marker_color="#10b981",
-            hovertemplate="<b>%{x}</b><br>現在価値: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
-        ))
-        
-        fig_bar.update_layout(
-            barmode="group",
-            hovermode="x unified",
-            margin=dict(l=20, r=20, t=30, b=30),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            yaxis_title="金額 (円)" if not mask_mode else "相対比率",
-            height=400
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-    else:
-        st.info("株式・暗号資産のデータがありません。")
-
-# ----------------------------------------------------
-# TAB 3: 銘柄別 利益ランキング
-# ----------------------------------------------------
-with tabs[2]:
-    st.subheader("買値からどれくらい利益が出ているか（銘柄別ランキング）")
-    pnl_df = df_portfolio[df_portfolio["asset_type"] != "cash"].copy()
-    if not pnl_df.empty:
-        pnl_df = pnl_df.sort_values("pnl_jpy", ascending=True)
-        colors = ["#10b981" if val >= 0 else "#ef4444" for val in pnl_df["pnl_jpy"]]
-        
-        fig_pnl = go.Figure(go.Bar(
-            x=pnl_df["pnl_jpy"] if not mask_mode else pnl_df["pnl_pct"],
-            y=pnl_df["name"],
-            orientation='h',
-            marker_color=colors,
-            text=[f"{'+' if p>=0 else ''}{p:.1f}%" for p in pnl_df["pnl_pct"]],
-            textposition="auto",
-            hovertemplate="<b>%{y}</b><br>" + ("損益: ¥%{x:,.0f}" if not mask_mode else "損益率: %{x:.1f}%") + "<extra></extra>"
-        ))
-        
-        fig_pnl.update_layout(
-            margin=dict(l=20, r=20, t=30, b=30),
-            xaxis_title="損益額 (円)" if not mask_mode else "損益率 (%)",
-            height=max(320, len(pnl_df) * 42)
-        )
-        st.plotly_chart(fig_pnl, use_container_width=True)
-
-# ----------------------------------------------------
-# TAB 4: 資産・セクター配分
-# ----------------------------------------------------
-with tabs[3]:
     st.subheader("資産のバランス・分散状況（円グラフ）")
     c_pie1, c_pie2 = st.columns(2)
     
@@ -1134,9 +1233,9 @@ with tabs[3]:
         st.plotly_chart(fig_sec_pie, use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 5: 保有銘柄 一覧表
+# TAB 3: 保有銘柄 一覧表
 # ----------------------------------------------------
-with tabs[4]:
+with tabs[2]:
     st.subheader("保有銘柄の詳細リスト")
     
     display_df = pd.DataFrame()
@@ -1191,10 +1290,10 @@ with tabs[4]:
     )
 
 # ----------------------------------------------------
-# TAB 6: 取引履歴 ログ一覧（列幅最適化 & メモ見やすく表示）
+# TAB 4: 取引履歴 ログ一覧（列幅最適化 & メモ見やすく表示）
 # ----------------------------------------------------
-if is_transaction_mode and len(tabs) > 5:
-    with tabs[5]:
+if is_transaction_mode and len(tabs) > 3:
+    with tabs[3]:
         st.subheader("📜 登録されている取引履歴（売買ログ一覧）")
         st.caption("スプレッドシートから読み込まれた全取引の記録です。（BUY/SELL時は手数料0.4905%自動適用、入金時は0円）")
         
