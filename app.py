@@ -104,18 +104,12 @@ st.markdown("""
         border-radius: 12px;
         overflow: hidden;
     }
-    
-    .filter-btn-container {
-        display: flex;
-        gap: 8px;
-        margin-bottom: 12px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ==========================================
-# 2. 定数・辞書マッピング
+# 2. 定数・辞書マッピング（爆速化用事前登録）
 # ==========================================
 SECTOR_JP_MAP = {
     "Technology": "テクノロジー (IT)",
@@ -142,6 +136,16 @@ POPULAR_JP_NAMES = {
     "LPTH": "LightPath Technologies",
     "FNV": "Franco-Nevada",
     "CRDO": "Credo Technology",
+    "RBRK": "Rubrik",
+    "ONDS": "Ondas Holdings",
+    "MRVL": "Marvell Technology",
+    "LLY": "Eli Lilly (イーライリリー)",
+    "CELH": "Celsius Holdings",
+    "ERO": "Ero Copper",
+    "OSS": "One Stop Systems",
+    "VST": "Vistra",
+    "APP": "AppLovin",
+    "ALAB": "Astera Labs",
     "7203.T": "トヨタ自動車",
     "9432.T": "日本電信電話 (NTT)",
     "9984.T": "ソフトバンクグループ",
@@ -164,6 +168,10 @@ POPULAR_JP_NAMES = {
     "VTI": "全米株式 ETF (VTI)",
     "VT": "全世界株式 ETF (VT)",
     "QQQ": "ナスダック100 ETF (QQQ)",
+    "USD": "米ドル 預金",
+    "JPY": "日本円 預金",
+    "USD_CASH": "米ドル 預金",
+    "JPY_CASH": "日本円 預金",
 }
 
 POPULAR_SECTORS = {
@@ -175,6 +183,16 @@ POPULAR_SECTORS = {
     "LPTH": "テクノロジー (IT)",
     "FNV": "素材・貴金属",
     "CRDO": "テクノロジー (IT)",
+    "RBRK": "テクノロジー (IT)",
+    "ONDS": "テクノロジー (IT)",
+    "MRVL": "テクノロジー (IT)",
+    "LLY": "ヘルスケア・医療",
+    "CELH": "生活必需品 (飲料)",
+    "ERO": "素材・鉱業",
+    "OSS": "テクノロジー (IT)",
+    "VST": "公益事業・電力",
+    "APP": "テクノロジー (IT)",
+    "ALAB": "テクノロジー (IT)",
     "AAPL": "テクノロジー (IT)",
     "MSFT": "テクノロジー (IT)",
     "NVDA": "テクノロジー (IT)",
@@ -185,27 +203,31 @@ POPULAR_SECTORS = {
     "7203.T": "一般消費財 (自動車)",
     "9432.T": "通信・メディア",
     "8306.T": "金融",
+    "USD": "現金・預金",
+    "JPY": "現金・預金",
+    "USD_CASH": "現金・預金",
+    "JPY_CASH": "現金・預金",
 }
 
 
 # ==========================================
 # 3. 高速化キャッシュ＆データ取得関数
 # ==========================================
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_all_market_data_fast(tickers_tuple):
-    """全銘柄の株価とUSD/JPY為替レートを1回のリクエストで一括取得"""
+    """全銘柄の株価とUSD/JPY為替レートを一括爆速取得"""
     prices = {}
     valid_tickers = []
     
     for t in tickers_tuple:
         t_str = str(t).strip().upper()
-        if t_str in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or "CASH" in t_str:
+        if t_str in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or t_str.endswith("_CASH"):
             prices[str(t).strip()] = 1.0
         else:
             valid_tickers.append(str(t).strip())
             
     fetch_list = list(set(valid_tickers + ["USDJPY=X"]))
-    usd_jpy = 155.0
+    usd_jpy = 158.0
     if fetch_list:
         try:
             df_hist = yf.download(
@@ -238,12 +260,12 @@ def fetch_all_market_data_fast(tickers_tuple):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_ticker_meta_info(ticker_str):
-    """銘柄名・セクター・通貨などの静的情報を取得（24時間キャッシュ）"""
+    """銘柄名・セクター・通貨などの静的情報を取得（軽量・非同期フォールバック）"""
     t = str(ticker_str).strip()
     t_upper = t.upper()
     
     # 現金
-    if t_upper in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or "CASH" in t_upper:
+    if t_upper in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or t_upper.endswith("_CASH"):
         curr = "JPY" if "JPY" in t_upper else "USD"
         name = "日本円 預金" if curr == "JPY" else "米ドル 預金"
         return {"name": name, "sector": "現金・預金", "currency": curr, "asset_type": "cash"}
@@ -259,33 +281,32 @@ def get_ticker_meta_info(ticker_str):
     name = POPULAR_JP_NAMES.get(t, t)
     sector = POPULAR_SECTORS.get(t, "その他")
 
-    if t not in POPULAR_JP_NAMES or t not in POPULAR_SECTORS:
-        try:
-            tk = yf.Ticker(t)
-            info = getattr(tk, "info", {})
-            if isinstance(info, dict):
-                if t not in POPULAR_JP_NAMES:
-                    name = info.get("shortName") or info.get("longName") or t
-                if t not in POPULAR_SECTORS:
-                    raw_sec = info.get("sector") or info.get("category") or "その他"
-                    sector = SECTOR_JP_MAP.get(raw_sec, raw_sec)
-                if "currency" in info and info["currency"]:
-                    curr = info["currency"].upper()
-        except Exception:
-            pass
-            
+    # 辞書にあれば即座に返却（重い通信を一切行わない爆速化）
+    if t in POPULAR_JP_NAMES and t in POPULAR_SECTORS:
+        return {"name": name, "sector": sector, "currency": curr, "asset_type": "stock"}
+
+    # 辞書にない場合のみ yfinance の fast_info を確認
+    try:
+        tk = yf.Ticker(t)
+        info = getattr(tk, "fast_info", {})
+        if info:
+            if t not in POPULAR_JP_NAMES:
+                name = getattr(info, "name", t) or t
+            if "currency" in dir(info):
+                curr = str(getattr(info, "currency", curr)).upper()
+    except Exception:
+        pass
+        
     return {"name": name, "sector": sector, "currency": curr, "asset_type": "stock"}
 
 
 # ==========================================
-# 4. 取引履歴（売買ログ）からの資産推移計算エンジン
+# 4. 取引履歴からの資産推移計算エンジン（爆速キャッシュ）
 # ==========================================
-@st.cache_data(ttl=900, show_spinner=False)
-def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FIXED_FEE_RATE):
+@st.cache_data(ttl=1800, show_spinner=False)
+def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FIXED_FEE_RATE):
     """
-    取引履歴（date, action, ticker, shares, price）から
-    日別の資産推移（df_history）と現在の保有資産スナップショット（df_current_portfolio）を算出
-    ※BUY/SELL時は売買代金の0.4905%を手数料として自動計算、DEPOSIT/WITHDRAWは手数料0
+    取引履歴から日別の資産推移と現在の保有資産スナップショットを算出
     """
     df_tx = df_raw.copy()
     col_map = {}
@@ -303,7 +324,7 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
             col_map[c] = "price"
         elif c_clean in ["fee", "手数料", "費用"]:
             col_map[c] = "fee"
-        elif c_clean in ["memo", "備考", "メモ", "ノート"]:
+        elif c_clean in ["memo", "備考", "メモ", "ノート", "note", "メモ・備考"]:
             col_map[c] = "memo"
     df_tx = df_tx.rename(columns=col_map)
     
@@ -311,6 +332,8 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
         df_tx["price"] = 1.0
     if "fee" not in df_tx.columns:
         df_tx["fee"] = 0.0
+    if "memo" not in df_tx.columns:
+        df_tx["memo"] = ""
         
     df_tx["date"] = pd.to_datetime(df_tx["date"], errors="coerce").dt.tz_localize(None)
     df_tx = df_tx.dropna(subset=["date"])
@@ -319,8 +342,9 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
     df_tx["shares"] = pd.to_numeric(df_tx["shares"], errors="coerce").fillna(0.0)
     df_tx["price"] = pd.to_numeric(df_tx["price"], errors="coerce").fillna(1.0)
     df_tx["fee"] = pd.to_numeric(df_tx["fee"], errors="coerce").fillna(0.0)
+    df_tx["memo"] = df_tx["memo"].fillna("").astype(str).replace(["nan", "None", "<NA>"], "")
     
-    # 手数料の自動計算：BUY/SELLなら 0.4905%、DEPOSIT/WITHDRAWなどは 0
+    # 手数料自動計算
     for idx, r in df_tx.iterrows():
         act_norm = r["action"]
         t_norm = r["ticker"]
@@ -338,11 +362,10 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
     start_date = df_tx["date"].min()
     today = pd.Timestamp(date.today())
     
-    # 銘柄リスト
+    # 銘柄リスト（現金以外）
     all_tickers = df_tx["ticker"].unique()
     stock_tickers = [t for t in all_tickers if t not in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] and not t.endswith("_CASH")]
     
-    # 過去データ取得 (start_date 〜 today)
     fetch_list = list(set(stock_tickers + ["USDJPY=X"]))
     hist_prices = pd.DataFrame()
     if fetch_list:
@@ -373,7 +396,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
     else:
         fx_series = pd.Series(fallback_fx, index=date_range)
         
-    # 日次トラッキング
     cash_jpy = 0.0
     cash_usd = 0.0
     net_deposit_jpy = 0.0
@@ -402,7 +424,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
                 pr = tx["price"]
                 fee = tx["fee"]
                 
-                # アクションの正規化
                 if act in ["BUY", "買付", "買い", "購入"]:
                     act = "BUY"
                 elif act in ["SELL", "売却", "売り"]:
@@ -429,11 +450,11 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
                 elif act == "WITHDRAW":
                     if is_usd:
                         amt_usd = sh * pr
-                        cash_usd -= amt_usd
+                        cash_usd = max(0.0, cash_usd - amt_usd)
                         net_deposit_jpy -= amt_usd * fx_now
                     else:
                         amt_jpy = sh * pr
-                        cash_jpy -= amt_jpy
+                        cash_jpy = max(0.0, cash_jpy - amt_jpy)
                         net_deposit_jpy -= amt_jpy
                         
                 elif act == "BUY":
@@ -446,9 +467,20 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
                         else:
                             needed_usd = cost_local - cash_usd
                             cash_usd = 0.0
-                            cash_jpy -= needed_usd * fx_now
+                            needed_jpy = needed_usd * fx_now
+                            if cash_jpy >= needed_jpy:
+                                cash_jpy -= needed_jpy
+                            else:
+                                unfunded_jpy = needed_jpy - cash_jpy
+                                cash_jpy = 0.0
+                                net_deposit_jpy += unfunded_jpy
                     else:
-                        cash_jpy -= cost_local
+                        if cash_jpy >= cost_local:
+                            cash_jpy -= cost_local
+                        else:
+                            unfunded_jpy = cost_local - cash_jpy
+                            cash_jpy = 0.0
+                            net_deposit_jpy += unfunded_jpy
                         
                     if t not in holdings:
                         holdings[t] = {"shares": 0.0, "cost_basis_local": 0.0, "currency": curr}
@@ -524,7 +556,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
         
     df_history = pd.DataFrame(daily_records)
     
-    # 現在の保有スナップショット（df_current_portfolio）
     current_holdings = []
     for t, h in holdings.items():
         if h["shares"] > 0:
@@ -544,11 +575,9 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=155.0, fee_rate=FI
     return df_history, df_current_portfolio, df_tx
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def calculate_holdings_history_fast(df_portfolio, fx_usd_jpy):
-    """
-    保有資産一覧形式（ticker, shares, buy_price）から過去1年間の仮想資産推移を計算
-    """
+    """保有資産一覧形式からの仮想資産推移計算"""
     tickers = [t for t in df_portfolio["ticker"].unique() if not str(t).upper().endswith("CASH") and str(t).upper() not in ["JPY", "USD"]]
     fetch_list = list(set(tickers + ["USDJPY=X"]))
     
@@ -624,7 +653,7 @@ def calculate_portfolio_fast(df, fx_usd_jpy, fee_rate=FIXED_FEE_RATE):
     
     for col in ["ticker", "shares", "buy_price"]:
         if col not in df.columns:
-            st.error(f"CSVデータに必要な列 '{col}' が見つかりません。")
+            st.error(f"データに必要な列 '{col}' が見つかりません。")
             return pd.DataFrame()
             
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0)
@@ -672,37 +701,26 @@ def calculate_portfolio_fast(df, fx_usd_jpy, fee_rate=FIXED_FEE_RATE):
 
 
 # ==========================================
-# 6. サンプルデータ生成（fee列なしのシンプル版）
+# 6. スプレッドシート読み込み関数（キャッシュ最適化）
 # ==========================================
-def get_sample_transactions():
-    return pd.DataFrame([
-        {"date": "2023-01-10", "action": "DEPOSIT", "ticker": "JPY_CASH", "shares": 2000000, "price": 1.0, "memo": "初期入金"},
-        {"date": "2023-01-15", "action": "BUY", "ticker": "AAPL", "shares": 15, "price": 135.0, "memo": "アップル新規買付"},
-        {"date": "2023-02-01", "action": "BUY", "ticker": "MSFT", "shares": 10, "price": 250.0, "memo": "マイクロソフト買付"},
-        {"date": "2023-03-10", "action": "BUY", "ticker": "7203.T", "shares": 200, "price": 1850.0, "memo": "トヨタ自動車買付"},
-        {"date": "2023-06-01", "action": "BUY", "ticker": "NVDA", "shares": 15, "price": 380.0, "memo": "エヌビディア買付"},
-        {"date": "2023-08-15", "action": "DEPOSIT", "ticker": "JPY_CASH", "shares": 1000000, "price": 1.0, "memo": "追加資金入金"},
-        {"date": "2023-09-01", "action": "BUY", "ticker": "BTC-USD", "shares": 0.05, "price": 26000.0, "memo": "ビットコイン積立"},
-        {"date": "2023-11-20", "action": "BUY", "ticker": "AAPL", "shares": 10, "price": 190.0, "memo": "アップル買い増し"},
-        {"date": "2024-02-15", "action": "BUY", "ticker": "7203.T", "shares": 100, "price": 3100.0, "memo": "トヨタ買い増し"},
-        {"date": "2024-05-10", "action": "BUY", "ticker": "NVDA", "shares": 10, "price": 900.0, "memo": "エヌビディア買い増し"},
-        {"date": "2024-07-20", "action": "SELL", "ticker": "AAPL", "shares": 5, "price": 225.0, "memo": "アップル一部利確"},
-    ])
+@st.cache_data(ttl=300, show_spinner=False)
+def load_sheet_data(url):
+    clean_url = url.strip()
+    if "/pubhtml" in clean_url:
+        clean_url = clean_url.replace("/pubhtml", "/pub?output=csv")
+    elif "/edit" in clean_url:
+        clean_url = clean_url.split("/edit")[0] + "/export?format=csv"
 
-def get_sample_portfolio():
-    return pd.DataFrame([
-        {"ticker": "AAPL", "shares": 20, "buy_price": 157.0},
-        {"ticker": "MSFT", "shares": 10, "buy_price": 250.0},
-        {"ticker": "NVDA", "shares": 25, "buy_price": 588.0},
-        {"ticker": "7203.T", "shares": 300, "buy_price": 2266.0},
-        {"ticker": "BTC-USD", "shares": 0.05, "buy_price": 26040.0},
-        {"ticker": "JPY_CASH", "shares": 1200000, "buy_price": 1.0},
-        {"ticker": "USD_CASH", "shares": 1124, "buy_price": 1.0},
-    ])
+    sep = "&" if "?" in clean_url else "?"
+    busted_url = f"{clean_url}{sep}_t={int(datetime.now().timestamp())}"
+    headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+    res = requests.get(busted_url, headers=headers, timeout=8)
+    res.raise_for_status()
+    return pd.read_csv(io.StringIO(res.text), encoding="utf-8-sig")
 
 
 # ==========================================
-# 7. サイドバー & データ読込
+# 7. サイドバー & データ連携（Googleスプレッドシート固定）
 # ==========================================
 configured_url = ""
 try:
@@ -715,7 +733,7 @@ if not configured_url:
     configured_url = DEFAULT_SPREADSHEET_URL
 
 with st.sidebar:
-    st.markdown("### ⚙️ 設定 & データ連携")
+    st.markdown("### ⚙️ 設定 & スプレッドシート連携")
     mask_mode = st.toggle("🔒 金額を伏せる (目隠しモード)", value=False, help="金額（円）を伏せて構成比や損益率(%)のみ表示します。")
     st.markdown("---")
     
@@ -724,104 +742,40 @@ with st.sidebar:
     fx_input = st.number_input("為替レート (円/ドル)", value=float(default_fx), step=0.5, format="%.2f")
     
     st.markdown(f"**💳 手数料自動計算**")
-    st.caption(f"・BUY / SELL: 売買金額の **{FIXED_FEE_RATE*100:.4f}%** 自動計算\n・DEPOSIT / 出金: **0円**（fee列は不要）")
+    st.caption(f"・BUY / SELL: **{FIXED_FEE_RATE*100:.4f}%** 自動適用\n・DEPOSIT: **0円**（fee列は不要）")
     
     st.markdown("---")
-    st.markdown("### 📂 ポートフォリオの読込")
-    data_source = st.radio(
-        "データ取得元を選択",
-        [
-            "☁️ Googleスプレッドシート / URL",
-            "📎 CSVファイルをアップロード",
-            "📜 サンプル取引履歴（売買ログ）",
-            "📝 サンプル保有資産一覧"
-        ],
-        index=2
+    st.markdown("### ☁️ スプレッドシート設定")
+    sheet_url = st.text_input(
+        "公開CSV URL",
+        value=configured_url,
+        help="Googleスプレッドシートの「ウェブに公開(CSV)」URLです。"
     )
     
-    df_raw = None
-    if data_source == "☁️ Googleスプレッドシート / URL":
-        sheet_url = st.text_input(
-            "スプレッドシートのCSV公開URL",
-            value=configured_url,
-            placeholder="https://docs.google.com/spreadsheets/d/.../pub?output=csv",
-            help="取引履歴または保有資産のCSV公開URLを入力してください。"
-        )
+    if st.button("🔄 スプレッドシートを再読込", use_container_width=True, type="primary"):
+        st.cache_data.clear()
+        st.rerun()
         
-        if st.button("🔄 最新データを再取得", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    df_raw = None
+    if sheet_url and sheet_url.strip():
+        try:
+            df_raw = load_sheet_data(sheet_url)
+            st.success("✅ スプレッドシートを読み込みました！")
+        except Exception as e:
+            st.error(f"スプレッドシート読込失敗: {e}")
             
-        if sheet_url and sheet_url.strip():
-            try:
-                clean_url = sheet_url.strip()
-                if "/pubhtml" in clean_url:
-                    clean_url = clean_url.replace("/pubhtml", "/pub?output=csv")
-                elif "/edit" in clean_url:
-                    clean_url = clean_url.split("/edit")[0] + "/export?format=csv"
-
-                sep = "&" if "?" in clean_url else "?"
-                busted_url = f"{clean_url}{sep}_t={int(datetime.now().timestamp())}"
-                headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
-                res = requests.get(busted_url, headers=headers, timeout=10)
-                res.raise_for_status()
-                df_raw = pd.read_csv(io.StringIO(res.text), encoding="utf-8-sig")
-                st.success("✅ スプレッドシートを読み込みました！")
-            except Exception as e:
-                st.error(f"スプレッドシートの読み込みに失敗しました: {e}")
-                df_raw = get_sample_transactions()
-        else:
-            df_raw = get_sample_transactions()
-            
-    elif data_source == "📎 CSVファイルをアップロード":
-        uploaded_file = st.file_uploader("取引履歴または保有資産のCSVを選択", type=["csv"])
+    with st.expander("📎 予備：CSVファイルアップロード"):
+        uploaded_file = st.file_uploader("CSVを選択", type=["csv"])
         if uploaded_file:
             df_raw = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-            st.success("✅ CSVファイルを読み込みました！")
-        else:
-            df_raw = get_sample_transactions()
-    elif data_source == "📜 サンプル取引履歴（売買ログ）":
-        df_raw = get_sample_transactions()
-    else:
-        df_raw = get_sample_portfolio()
-
-    st.markdown("---")
-    with st.expander("📥 テンプレートCSVのダウンロード"):
-        st.caption("スプレッドシートやExcelの雛形としてご利用いただけます。")
-        tx_csv = get_sample_transactions().to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="📜 取引履歴サンプル.csv",
-            data=tx_csv,
-            file_name="sample_transactions.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-        port_csv = get_sample_portfolio().to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="📋 保有資産一覧サンプル.csv",
-            data=port_csv,
-            file_name="sample_portfolio.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-
-    with st.expander("💡 取引履歴の書き方ガイド"):
-        st.markdown("""
-        **必要カラム（`fee`列は不要です）：**
-        - `date`: 取引日 (`2023-01-15`)
-        - `action`: `BUY`(買付), `SELL`(売却), `DEPOSIT`(入金), `WITHDRAW`(出金)
-        - `ticker`: 銘柄コード (`AAPL`, `7203.T`, `BTC-USD`, `JPY_CASH`, `USD_CASH`)
-        - `shares`: 数量 (株数または金額)
-        - `price`: 単価 (現地通貨建。入出金時は 1.0)
-        - `memo`: メモ (任意)
-        """)
+            st.success("✅ CSV読込完了")
 
 
 # ==========================================
 # 8. データ処理 & 自動フォーマット判別
 # ==========================================
 if df_raw is None or df_raw.empty:
-    st.warning("表示できるデータがありません。")
+    st.warning("表示できるデータがありません。スプレッドシートのURLをご確認ください。")
     st.stop()
 
 # 列名チェック（取引履歴形式かどうかの自動判定）
@@ -852,7 +806,7 @@ h_col1, h_col2 = st.columns([3, 1])
 with h_col1:
     st.title("🏡 H.Tのポートフォリオ")
     mode_badge = "📜 取引履歴モード (完全推移)" if is_transaction_mode else "📋 保有資産一覧モード"
-    st.caption(f"最終更新: {datetime.now().strftime('%Y年%m月%d日 %H:%M')} | 為替: 1 USD = {fx_input:.2f} 円 | 手数料: **0.4905%自動計算** | モード: **{mode_badge}**")
+    st.caption(f"最終更新: {datetime.now().strftime('%Y年%m月%d日 %H:%M')} | 為替: 1 USD = {fx_input:.2f} 円 | 手数料: **0.4905%** | モード: **{mode_badge}**")
 with h_col2:
     st.markdown("<div style='margin-top: 18px;'></div>", unsafe_allow_html=True)
     if st.button("🔄 最新データに更新", use_container_width=True, help="スプレッドシートや株価の最新データを今すぐ再取得します"):
@@ -867,7 +821,7 @@ total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
 realized_pnl_total = df_history["realized_pnl_jpy"].iloc[-1] if (not df_history.empty and "realized_pnl_jpy" in df_history.columns) else 0.0
 net_deposit_total = df_history["net_deposit_jpy"].iloc[-1] if (not df_history.empty and "net_deposit_jpy" in df_history.columns) else total_cost
-all_time_high = df_history["total_value_jpy"].max() if not df_history.empty else total_value
+all_time_high = max(df_history["total_value_jpy"].max() if not df_history.empty else 0.0, total_value)
 
 def fmt_yen(val):
     if mask_mode:
@@ -888,16 +842,16 @@ with c1:
     <div class="metric-card">
         <div class="metric-title">📈 現在の総資産評価額</div>
         <div class="metric-value">{fmt_yen(total_value)}</div>
-        <span class="badge-neutral">最高額: {fmt_yen(all_time_high)}</span>
+        <span class="badge-neutral">最高額 (ATH): {fmt_yen(all_time_high)}</span>
     </div>
     """, unsafe_allow_html=True)
 
 with c2:
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-title">💰 投じた元本 ({'純入金額' if is_transaction_mode else '投資元本'})</div>
-        <div class="metric-value">{fmt_yen(net_deposit_total if is_transaction_mode else total_cost)}</div>
-        <span class="badge-neutral">{'入金累計 - 出金累計' if is_transaction_mode else '買付代金+手数料(0.4905%)'}</span>
+        <div class="metric-title">💰 投じた元本 (投資コスト)</div>
+        <div class="metric-value">{fmt_yen(total_cost)}</div>
+        <span class="badge-neutral">買付代金 + 手数料(0.4905%)</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -965,17 +919,15 @@ tabs = st.tabs(tab_titles)
 # ----------------------------------------------------
 with tabs[0]:
     st.subheader("📈 ポートフォリオの資産推移")
-    st.caption("過去から現在までの総資産評価額の推移と、投じた元本（純入金累計）の軌跡です。")
+    st.caption("過去から現在までの総資産評価額の推移と、投じた元本の軌跡です。")
     
     if not df_history.empty:
-        f_col1, f_col2 = st.columns([3, 1])
-        with f_col1:
-            period_choice = st.radio(
-                "表示期間",
-                ["全期間 (ALL)", "1年 (1Y)", "6ヶ月 (6M)", "3ヶ月 (3M)", "1ヶ月 (1M)", "年初来 (YTD)"],
-                horizontal=True,
-                index=0
-            )
+        period_choice = st.radio(
+            "表示期間",
+            ["全期間 (ALL)", "1年 (1Y)", "6ヶ月 (6M)", "3ヶ月 (3M)", "1ヶ月 (1M)", "年初来 (YTD)"],
+            horizontal=True,
+            index=0
+        )
             
         latest_dt = df_history["date"].max()
         if period_choice == "1ヶ月 (1M)":
@@ -999,7 +951,7 @@ with tabs[0]:
         fig_timeline.add_trace(go.Scatter(
             x=view_hist["date"],
             y=view_hist["net_deposit_jpy"] if not mask_mode else [100] * len(view_hist),
-            name="投資元本 (純入金)",
+            name="投資元本 (投入資金)",
             mode="lines",
             line=dict(color="#94a3b8", width=2, dash="dash"),
             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>投資元本: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
@@ -1022,7 +974,7 @@ with tabs[0]:
             margin=dict(l=20, r=20, t=30, b=30),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             yaxis_title="金額 (円)" if not mask_mode else "パフォーマンス指数",
-            height=440,
+            height=430,
             xaxis=dict(showgrid=True, gridcolor="#f1f5f9"),
             yaxis=dict(showgrid=True, gridcolor="#f1f5f9")
         )
@@ -1030,7 +982,6 @@ with tabs[0]:
         
         # 資産内訳推移（積み上げエリアチャート）
         st.markdown("##### 🧱 資産内訳のボリューム推移")
-        st.caption("現金や各保有銘柄がどのように成長・構成されてきたかを可視化しています。")
         
         stock_cols = [c for c in view_hist.columns if c not in [
             "date", "total_value_jpy", "net_deposit_jpy", "cash_jpy", "equity_jpy",
@@ -1038,16 +989,17 @@ with tabs[0]:
         ]]
         
         fig_area = go.Figure()
-        fig_area.add_trace(go.Scatter(
-            x=view_hist["date"],
-            y=view_hist["cash_jpy"] if not mask_mode else [1] * len(view_hist),
-            name="現金・預金",
-            mode="lines",
-            stackgroup="one",
-            line=dict(width=0.5, color="#cbd5e1"),
-            fillcolor="#e2e8f0",
-            hovertemplate="現金: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
-        ))
+        if (view_hist["cash_jpy"] > 0).any():
+            fig_area.add_trace(go.Scatter(
+                x=view_hist["date"],
+                y=view_hist["cash_jpy"] if not mask_mode else [1] * len(view_hist),
+                name="現金・預金",
+                mode="lines",
+                stackgroup="one",
+                line=dict(width=0.5, color="#cbd5e1"),
+                fillcolor="#e2e8f0",
+                hovertemplate="現金: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
+            ))
         
         colors_palette = px.colors.qualitative.Pastel + px.colors.qualitative.Safe
         for idx, s_col in enumerate(stock_cols):
@@ -1069,7 +1021,7 @@ with tabs[0]:
             margin=dict(l=20, r=20, t=30, b=30),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             yaxis_title="評価額 (円)" if not mask_mode else "構成比",
-            height=380,
+            height=370,
             xaxis=dict(showgrid=True, gridcolor="#f1f5f9"),
             yaxis=dict(showgrid=True, gridcolor="#f1f5f9")
         )
@@ -1083,7 +1035,6 @@ with tabs[0]:
 # ----------------------------------------------------
 with tabs[1]:
     st.subheader("銘柄ごとの「買値」と「現在の価値」の比較")
-    st.caption("投資した元本（青）に対して、現在の価値（緑）がどれだけ増えたかが分かります。")
     
     plot_df = df_portfolio[df_portfolio["asset_type"] != "cash"].copy()
     if not plot_df.empty:
@@ -1111,7 +1062,7 @@ with tabs[1]:
             margin=dict(l=20, r=20, t=30, b=30),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             yaxis_title="金額 (円)" if not mask_mode else "相対比率",
-            height=420
+            height=400
         )
         st.plotly_chart(fig_bar, use_container_width=True)
     else:
@@ -1140,7 +1091,7 @@ with tabs[2]:
         fig_pnl.update_layout(
             margin=dict(l=20, r=20, t=30, b=30),
             xaxis_title="損益額 (円)" if not mask_mode else "損益率 (%)",
-            height=max(350, len(pnl_df) * 45)
+            height=max(320, len(pnl_df) * 42)
         )
         st.plotly_chart(fig_pnl, use_container_width=True)
 
@@ -1165,7 +1116,7 @@ with tabs[3]:
             color_discrete_sequence=px.colors.qualitative.Safe
         )
         fig_asset_pie.update_traces(textinfo="label+percent", hovertemplate="<b>%{label}</b><br>構成比: %{percent}")
-        fig_asset_pie.update_layout(showlegend=False, margin=dict(l=20, r=20, t=20, b=20), height=350)
+        fig_asset_pie.update_layout(showlegend=False, margin=dict(l=20, r=20, t=20, b=20), height=330)
         st.plotly_chart(fig_asset_pie, use_container_width=True)
         
     with c_pie2:
@@ -1179,19 +1130,19 @@ with tabs[3]:
             color_discrete_sequence=px.colors.qualitative.Pastel
         )
         fig_sec_pie.update_traces(textinfo="label+percent", hovertemplate="<b>%{label}</b><br>構成比: %{percent}")
-        fig_sec_pie.update_layout(showlegend=False, margin=dict(l=20, r=20, t=20, b=20), height=350)
+        fig_sec_pie.update_layout(showlegend=False, margin=dict(l=20, r=20, t=20, b=20), height=330)
         st.plotly_chart(fig_sec_pie, use_container_width=True)
 
 # ----------------------------------------------------
 # TAB 5: 保有銘柄 一覧表
 # ----------------------------------------------------
 with tabs[4]:
-    st.subheader("保有銘柄の詳細リスト（名前・セクターは自動取得）")
+    st.subheader("保有銘柄の詳細リスト")
     
     display_df = pd.DataFrame()
-    display_df["銘柄名 (自動取得)"] = df_portfolio["name"]
+    display_df["銘柄名"] = df_portfolio["name"]
     display_df["ティッカー"] = df_portfolio["ticker"]
-    display_df["セクター (自動分類)"] = df_portfolio["sector"]
+    display_df["セクター"] = df_portfolio["sector"]
     display_df["保有数"] = df_portfolio["shares"].apply(lambda x: f"{x:,.4f}" if (x % 1 != 0 and x < 1) else (f"{x:,.2f}" if x % 1 != 0 else f"{int(x):,}"))
     display_df["買付単価 (平均)"] = df_portfolio.apply(lambda r: f"{r['buy_price']:,.2f} {r['currency']}", axis=1)
     display_df["現在価格"] = df_portfolio.apply(lambda r: f"{r['current_price']:,.2f} {r['currency']}", axis=1)
@@ -1220,29 +1171,76 @@ with tabs[4]:
     except AttributeError:
         styled_table = display_df.style.applymap(color_pnl, subset=["買値からの損益 (円)", "損益率 (リターン)"])
         
-    st.dataframe(styled_table, use_container_width=True, hide_index=True)
+    st.dataframe(
+        styled_table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "銘柄名": st.column_config.TextColumn("銘柄名", width="medium"),
+            "ティッカー": st.column_config.TextColumn("ティッカー", width="small"),
+            "セクター": st.column_config.TextColumn("セクター", width="small"),
+            "保有数": st.column_config.TextColumn("保有数", width="small"),
+            "買付単価 (平均)": st.column_config.TextColumn("買付単価", width="small"),
+            "現在価格": st.column_config.TextColumn("現在価格", width="small"),
+            "投資元本 (円)": st.column_config.TextColumn("投資元本", width="small"),
+            "現在評価額 (円)": st.column_config.TextColumn("現在評価額", width="small"),
+            "買値からの損益 (円)": st.column_config.TextColumn("損益額", width="small"),
+            "損益率 (リターン)": st.column_config.TextColumn("リターン", width="small"),
+            "構成比": st.column_config.TextColumn("構成比", width="small"),
+        }
+    )
 
 # ----------------------------------------------------
-# TAB 6: 取引履歴 ログ一覧 (取引履歴モード時)
+# TAB 6: 取引履歴 ログ一覧（列幅最適化 & メモ見やすく表示）
 # ----------------------------------------------------
 if is_transaction_mode and len(tabs) > 5:
     with tabs[5]:
         st.subheader("📜 登録されている取引履歴（売買ログ一覧）")
-        st.caption("スプレッドシートやCSVから読み込まれた全取引の記録です。（BUY/SELL時は手数料0.4905%自動適用、入金時は0円）")
+        st.caption("スプレッドシートから読み込まれた全取引の記録です。（BUY/SELL時は手数料0.4905%自動適用、入金時は0円）")
         
         log_df = df_tx_log.copy()
         log_df["取引日"] = pd.to_datetime(log_df["date"]).dt.strftime("%Y/%m/%d")
         
-        act_trans = {"BUY": "🟢 買付 (BUY)", "SELL": "🔴 売却 (SELL)", "DEPOSIT": "💰 入金 (DEPOSIT)", "WITHDRAW": "💸 出金 (WITHDRAW)", "DIVIDEND": "🎁 配当 (DIVIDEND)"}
+        act_trans = {
+            "BUY": "🟢 買付 (BUY)",
+            "SELL": "🔴 売却 (SELL)",
+            "DEPOSIT": "💰 入金 (DEPOSIT)",
+            "WITHDRAW": "💸 出金 (WITHDRAW)",
+            "DIVIDEND": "🎁 配当 (DIVIDEND)"
+        }
         log_df["取引種別"] = log_df["action"].map(act_trans).fillna(log_df["action"])
-        log_df["銘柄"] = log_df["ticker"].apply(lambda t: f"{POPULAR_JP_NAMES.get(t, t)} ({t})")
+        
+        def format_ticker_name(t):
+            t_clean = str(t).strip()
+            name = POPULAR_JP_NAMES.get(t_clean, "")
+            if name and name != t_clean:
+                return f"{name} ({t_clean})"
+            return t_clean
+
+        log_df["銘柄"] = log_df["ticker"].apply(format_ticker_name)
         log_df["数量"] = log_df["shares"].apply(lambda x: f"{x:,.4f}" if (x % 1 != 0 and x < 1) else (f"{x:,.2f}" if x % 1 != 0 else f"{int(x):,}"))
         log_df["約定単価"] = log_df["price"].apply(lambda p: f"{p:,.2f}")
-        log_df["手数料 (自動計算)"] = log_df["fee"].apply(lambda f: f"{f:,.2f}" if f > 0 else "0")
-        log_df["メモ・備考"] = log_df.get("memo", "")
+        log_df["手数料 (0.4905%)"] = log_df["fee"].apply(lambda f: f"{f:,.2f}" if f > 0 else "0")
         
-        disp_log = log_df[["取引日", "取引種別", "銘柄", "数量", "約定単価", "手数料 (自動計算)", "メモ・備考"]]
-        st.dataframe(disp_log, use_container_width=True, hide_index=True)
+        # None や nan を完全に除去
+        log_df["メモ・備考"] = log_df.get("memo", "").fillna("").astype(str).replace(["nan", "None", "<NA>"], "")
+        
+        disp_log = log_df[["取引日", "取引種別", "銘柄", "数量", "約定単価", "手数料 (0.4905%)", "メモ・備考"]]
+        
+        st.dataframe(
+            disp_log,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "取引日": st.column_config.TextColumn("取引日", width=100),
+                "取引種別": st.column_config.TextColumn("取引種別", width=130),
+                "銘柄": st.column_config.TextColumn("銘柄", width=220),
+                "数量": st.column_config.TextColumn("数量", width=90),
+                "約定単価": st.column_config.TextColumn("約定単価", width=100),
+                "手数料 (0.4905%)": st.column_config.TextColumn("手数料", width=90),
+                "メモ・備考": st.column_config.TextColumn("メモ・備考", width="large"),
+            }
+        )
 
 st.markdown("---")
 st.caption("💡 スプレッドシートを更新すれば、この画面にも自動で最新データが反映されます。")
