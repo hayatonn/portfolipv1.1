@@ -408,7 +408,7 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
         tx_by_date.setdefault(d, []).append(row)
         
     daily_records = []
-    trade_records = []  # ★トレード記録用配列を追加
+    trade_records = []
     
     for current_dt in date_range:
         fx_now = float(fx_series.loc[current_dt]) if current_dt in fx_series.index else fallback_fx
@@ -527,7 +527,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                         holdings[t]["shares"] = max(0.0, prev_sh - sh)
                         holdings[t]["cost_basis_local"] = max(0.0, prev_cost - sold_cost)
                         
-                        # ★ 売却時のみトレード実績として記録 (配当は除外)
                         trade_records.append({
                             "ticker": t,
                             "date": current_dt,
@@ -591,7 +590,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
         
     df_history = pd.DataFrame(daily_records)
     
-    # ★ トレード分析（実現損益・勝率・ペイオフレシオ）の集計ロジック
     df_trades = pd.DataFrame(trade_records)
     analysis = []
     if not df_trades.empty:
@@ -794,7 +792,7 @@ def load_sheet_data(url):
 
 
 # ==========================================
-# 7. サイドバー & データ連携（Googleスプレッドシート固定）
+# 7. サイドバー & データ連携
 # ==========================================
 configured_url = ""
 try:
@@ -852,7 +850,6 @@ if df_raw is None or df_raw.empty:
     st.warning("表示できるデータがありません。スプレッドシートのURLをご確認ください。")
     st.stop()
 
-# 列名チェック（取引履歴形式かどうかの自動判定）
 cols_lower = [str(c).strip().replace(" ", "").lower() for c in df_raw.columns]
 has_date = any(k in cols_lower for k in ["date", "日付", "日時", "取引日"])
 has_action = any(k in cols_lower for k in ["action", "種別", "取引", "売買", "type"])
@@ -860,10 +857,9 @@ is_transaction_mode = has_date and has_action
 
 df_history = pd.DataFrame()
 df_tx_log = pd.DataFrame()
-df_trade_analysis = pd.DataFrame() # ★ 初期化
+df_trade_analysis = pd.DataFrame()
 
 if is_transaction_mode:
-    # ★ 戻り値に df_trade_analysis を追加
     df_history, df_portfolio_raw, df_tx_log, df_trade_analysis = calculate_portfolio_from_transactions(df_raw, fallback_fx=fx_input, fee_rate=FIXED_FEE_RATE)
     df_portfolio = calculate_portfolio_fast(df_portfolio_raw, fx_usd_jpy=fx_input, fee_rate=FIXED_FEE_RATE)
 else:
@@ -985,7 +981,6 @@ tab_titles = [
 ]
 if is_transaction_mode:
     tab_titles.append("📜 【取引履歴 ログ一覧】")
-    # ★ 新規タブ追加
     tab_titles.append("🏆 【トレード分析・確定損益】")
 
 tabs = st.tabs(tab_titles)
@@ -1033,7 +1028,6 @@ with tabs[0]:
         fig_timeline = go.Figure()
         
         if main_chart_unit == "💰 金額 (円)":
-            # 投資元本ライン
             fig_timeline.add_trace(go.Scatter(
                 x=view_hist["date"],
                 y=view_hist["net_deposit_jpy"] if not mask_mode else [100] * len(view_hist),
@@ -1043,7 +1037,6 @@ with tabs[0]:
                 hovertemplate="<b>%{x|%Y/%m/%d}</b><br>投資元本: " + ("¥%{y:,.0f}" if not mask_mode else "マスク中") + "<extra></extra>"
             ))
             
-            # 総資産額ライン
             fig_timeline.add_trace(go.Scatter(
                 x=view_hist["date"],
                 y=view_hist["total_value_jpy"] if not mask_mode else [100 * (1 + row.pnl_pct/100) for _, row in view_hist.iterrows()],
@@ -1055,7 +1048,7 @@ with tabs[0]:
                 hovertemplate="<b>%{x|%Y/%m/%d}</b><br>総資産額: " + ("¥%{y:,.0f}" if not mask_mode else "相対指数") + "<extra></extra>"
             ))
             y_main_title = "金額 (円)" if not mask_mode else "パフォーマンス指数"
-        else: # 損益率 (%)
+        else: 
             fig_timeline.add_hline(y=0, line_dash="dash", line_color="#94a3b8", line_width=1.5)
             fig_timeline.add_trace(go.Scatter(
                 x=view_hist["date"],
@@ -1080,31 +1073,26 @@ with tabs[0]:
         )
         st.plotly_chart(fig_timeline, use_container_width=True)
         
-        # 2. 銘柄別・含み損益率の推移（動的フィルタリング対応）
         st.markdown("---")
         st.markdown("##### 📈 銘柄別の含み損益率推移")
         
-        # 描画対象となる銘柄カラムを抽出
         stock_cols = [c for c in view_hist.columns if c not in [
             "date", "total_value_jpy", "net_deposit_jpy", "cash_jpy", "equity_jpy",
             "unrealized_pnl_jpy", "pnl_pct", "realized_pnl_jpy", "usd_jpy"
         ] and not c.endswith("_pnl_pct")]
 
-        # 表示可能なティッカー（カラム名）を抽出し、アルファベット順にソート
         valid_tickers = []
         for s_col in stock_cols:
             if (view_hist[s_col] > 0).any() or (f"{s_col}_pnl_pct" in view_hist and not view_hist[f"{s_col}_pnl_pct"].isna().all()):
                 valid_tickers.append(s_col)
                 
-        valid_tickers.sort() # ティッカーシンボルをA-Z順にソート
+        valid_tickers.sort()
         
-        # ソートされたティッカー順に従って、表示用辞書を作成
         ticker_options = {}
         for s_col in valid_tickers:
             s_name = POPULAR_JP_NAMES.get(s_col, s_col)
             ticker_options[s_name] = s_col
                 
-        # マルチセレクトによる銘柄選択 (初期状態は空配列で白紙)
         selected_names = st.multiselect(
             "📊 比較検証する銘柄を選択（クリックで追加・Backspaceで削除）",
             options=list(ticker_options.keys()),
@@ -1122,10 +1110,8 @@ with tabs[0]:
             "#a855f7", "#e11d48", "#0284c7", "#d97706", "#475569"
         ]
         
-        # ゼロライン（損益分岐点）を追加
         fig_sub.add_hline(y=0, line_dash="dash", line_color="#94a3b8", line_width=1.5)
 
-        # 選択された銘柄のみをチャートに描画
         for idx, s_col in enumerate(selected_cols):
             s_name = POPULAR_JP_NAMES.get(s_col, s_col)
             line_color = modern_colors[idx % len(modern_colors)]
@@ -1136,7 +1122,7 @@ with tabs[0]:
                 y=pnl_series,
                 name=s_name,
                 mode="lines",
-                connectgaps=False, # 保有していない期間は線を途切れさせる
+                connectgaps=False, 
                 line=dict(width=2.5, color=line_color),
                 hovertemplate=f"<b>{s_name}</b>: %{{y:+.2f}}%<extra></extra>"
             ))
@@ -1194,7 +1180,7 @@ with tabs[1]:
         st.plotly_chart(fig_sec_pie, use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 3: 保有銘柄 一覧表
+# TAB 3: 保有銘柄 一覧表 (シンプル化対応)
 # ----------------------------------------------------
 with tabs[2]:
     st.subheader("保有銘柄の詳細リスト")
@@ -1203,17 +1189,10 @@ with tabs[2]:
     display_df["銘柄名"] = df_portfolio["name"]
     display_df["ティッカー"] = df_portfolio["ticker"]
     display_df["セクター"] = df_portfolio["sector"]
-    display_df["保有数"] = df_portfolio["shares"].apply(lambda x: f"{x:,.4f}" if (x % 1 != 0 and x < 1) else (f"{x:,.2f}" if x % 1 != 0 else f"{int(x):,}"))
-    display_df["買付単価 (平均)"] = df_portfolio.apply(lambda r: f"{r['buy_price']:,.2f} {r['currency']}", axis=1)
-    display_df["現在価格"] = df_portfolio.apply(lambda r: f"{r['current_price']:,.2f} {r['currency']}", axis=1)
     
     if not mask_mode:
-        display_df["投資元本 (円)"] = df_portfolio["cost_basis_jpy"].apply(lambda x: f"¥{x:,.0f}")
-        display_df["現在評価額 (円)"] = df_portfolio["market_value_jpy"].apply(lambda x: f"¥{x:,.0f}")
         display_df["買値からの損益 (円)"] = df_portfolio["pnl_jpy"].apply(lambda x: f"{'+' if x>=0 else ''}¥{x:,.0f}")
     else:
-        display_df["投資元本 (円)"] = "¥ ••••••"
-        display_df["現在評価額 (円)"] = "¥ ••••••"
         display_df["買値からの損益 (円)"] = df_portfolio["pnl_jpy"].apply(lambda x: "+¥ •••••" if x >= 0 else "-¥ •••••")
         
     display_df["損益率 (リターン)"] = df_portfolio["pnl_pct"].apply(lambda x: f"{'+' if x>=0 else ''}{x:.2f}%")
@@ -1239,11 +1218,6 @@ with tabs[2]:
             "銘柄名": st.column_config.TextColumn("銘柄名", width="medium"),
             "ティッカー": st.column_config.TextColumn("ティッカー", width="small"),
             "セクター": st.column_config.TextColumn("セクター", width="small"),
-            "保有数": st.column_config.TextColumn("保有数", width="small"),
-            "買付単価 (平均)": st.column_config.TextColumn("買付単価", width="small"),
-            "現在価格": st.column_config.TextColumn("現在価格", width="small"),
-            "投資元本 (円)": st.column_config.TextColumn("投資元本", width="small"),
-            "現在評価額 (円)": st.column_config.TextColumn("現在評価額", width="small"),
             "買値からの損益 (円)": st.column_config.TextColumn("損益額", width="small"),
             "損益率 (リターン)": st.column_config.TextColumn("リターン", width="small"),
             "構成比": st.column_config.TextColumn("構成比", width="small"),
@@ -1251,7 +1225,7 @@ with tabs[2]:
     )
 
 # ----------------------------------------------------
-# TAB 4: 取引履歴 ログ一覧
+# TAB 4: 取引履歴 ログ一覧 (最新順対応)
 # ----------------------------------------------------
 if is_transaction_mode and len(tabs) > 3:
     with tabs[3]:
@@ -1259,6 +1233,8 @@ if is_transaction_mode and len(tabs) > 3:
         st.caption("スプレッドシートから読み込まれた全取引の記録です。（BUY/SELL時は手数料0.4905%自動適用、入金時は0円）")
         
         log_df = df_tx_log.copy()
+        # ★ ここで最新の取引日付が一番上にくるように降順ソート
+        log_df = log_df.sort_values("date", ascending=False).reset_index(drop=True)
         log_df["取引日"] = pd.to_datetime(log_df["date"]).dt.strftime("%Y/%m/%d")
         
         act_trans = {
@@ -1317,7 +1293,6 @@ if is_transaction_mode and len(tabs) > 4:
             meta_df = pd.DataFrame(meta_records)
             ta_df["銘柄名"] = meta_df["name"]
             
-            # 列の整理とフォーマット
             cols = ["銘柄名", "ticker", "総売却回数", "勝率 (%)", "ペイオフレシオ", "累計確定損益 (円)", "実現リターン (%)", "平均利益 (円)", "平均損失 (円)"]
             ta_df = ta_df[cols]
             
@@ -1359,7 +1334,6 @@ if is_transaction_mode and len(tabs) > 4:
                 }
             )
             
-            # --- 投資の全体期待値 (Expectancy) の計算と表示 ---
             st.markdown("---")
             total_sell_count = ta_df["総売却回数"].sum()
             total_wins = df_trade_analysis["勝ち回数"].sum()
