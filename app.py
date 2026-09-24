@@ -215,7 +215,6 @@ POPULAR_SECTORS = {
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_all_market_data_fast(tickers_tuple):
-    """全銘柄の株価とUSD/JPY為替レートを一括爆速取得"""
     prices = {}
     valid_tickers = []
     
@@ -260,32 +259,26 @@ def fetch_all_market_data_fast(tickers_tuple):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_ticker_meta_info(ticker_str):
-    """銘柄名・セクター・通貨などの静的情報を取得（軽量・非同期フォールバック）"""
     t = str(ticker_str).strip()
     t_upper = t.upper()
     
-    # 現金
     if t_upper in ["JPY", "USD", "JPY_CASH", "USD_CASH", "CASH"] or t_upper.endswith("_CASH"):
         curr = "JPY" if "JPY" in t_upper else "USD"
         name = "日本円 預金" if curr == "JPY" else "米ドル 預金"
         return {"name": name, "sector": "現金・預金", "currency": curr, "asset_type": "cash"}
         
-    # 暗号資産
     if t.endswith("-USD") or t_upper in ["BTC", "ETH"]:
         symbol = t if t.endswith("-USD") else f"{t}-USD"
         name = POPULAR_JP_NAMES.get(symbol, symbol)
         return {"name": name, "sector": "暗号資産 (Crypto)", "currency": "USD", "asset_type": "crypto"}
 
-    # 株式
     curr = "JPY" if t.endswith(".T") else "USD"
     name = POPULAR_JP_NAMES.get(t, t)
     sector = POPULAR_SECTORS.get(t, "その他")
 
-    # 辞書にあれば即座に返却
     if t in POPULAR_JP_NAMES and t in POPULAR_SECTORS:
         return {"name": name, "sector": sector, "currency": curr, "asset_type": "stock"}
 
-    # 辞書にない場合のみ yfinance の fast_info を確認
     try:
         tk = yf.Ticker(t)
         info = getattr(tk, "fast_info", {})
@@ -301,13 +294,10 @@ def get_ticker_meta_info(ticker_str):
 
 
 # ==========================================
-# 4. 取引履歴からの資産推移計算エンジン（爆速キャッシュ）
+# 4. 取引履歴からの資産推移計算エンジン
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FIXED_FEE_RATE):
-    """
-    取引履歴から日別の資産推移と現在の保有資産スナップショットを算出
-    """
     df_tx = df_raw.copy()
     col_map = {}
     for c in df_tx.columns:
@@ -344,7 +334,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
     df_tx["fee"] = pd.to_numeric(df_tx["fee"], errors="coerce").fillna(0.0)
     df_tx["memo"] = df_tx["memo"].fillna("").astype(str).replace(["nan", "None", "<NA>"], "")
     
-    # 手数料自動計算
     for idx, r in df_tx.iterrows():
         act_norm = r["action"]
         t_norm = r["ticker"]
@@ -357,7 +346,7 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
     
     df_tx = df_tx.sort_values("date").reset_index(drop=True)
     if df_tx.empty:
-        return pd.DataFrame(), pd.DataFrame(), df_tx
+        return pd.DataFrame(), pd.DataFrame(), df_tx, pd.DataFrame()
         
     start_date = df_tx["date"].min()
     today = pd.Timestamp(date.today())
@@ -370,7 +359,6 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
         tu = str(tk_str).strip().upper()
         return tu in ["USD", "USD_CASH", "ドル", "米ドル"] or "USD" in tu
 
-    # 銘柄リスト（現金は絶対に除外）
     all_tickers = df_tx["ticker"].unique()
     stock_tickers = [t for t in all_tickers if not is_jpy_cash_ticker(t) and not is_usd_cash_ticker(t)]
     
@@ -420,6 +408,7 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
         tx_by_date.setdefault(d, []).append(row)
         
     daily_records = []
+    trade_records = []  # ★トレード記録用配列を追加
     
     for current_dt in date_range:
         fx_now = float(fx_series.loc[current_dt]) if current_dt in fx_series.index else fallback_fx
@@ -526,8 +515,10 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                         sold_cost = prev_cost * sold_fraction
                         
                         pnl_local = revenue_local - sold_cost
+                        pnl_jpy = pnl_local * (fx_now if curr == "USD" else 1.0)
+                        
                         if curr == "USD":
-                            realized_pnl_jpy += pnl_local * fx_now
+                            realized_pnl_jpy += pnl_jpy
                             cash_usd += revenue_local
                         else:
                             realized_pnl_jpy += pnl_local
@@ -535,6 +526,15 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
                             
                         holdings[t]["shares"] = max(0.0, prev_sh - sh)
                         holdings[t]["cost_basis_local"] = max(0.0, prev_cost - sold_cost)
+                        
+                        # ★ 売却時のみトレード実績として記録 (配当は除外)
+                        trade_records.append({
+                            "ticker": t,
+                            "date": current_dt,
+                            "revenue_jpy": revenue_local * (fx_now if curr == "USD" else 1.0),
+                            "cost_jpy": sold_cost * (fx_now if curr == "USD" else 1.0),
+                            "pnl_jpy": pnl_jpy
+                        })
                         
                 elif act == "DIVIDEND":
                     curr = "JPY" if t.endswith(".T") else "USD"
@@ -591,6 +591,42 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
         
     df_history = pd.DataFrame(daily_records)
     
+    # ★ トレード分析（実現損益・勝率・ペイオフレシオ）の集計ロジック
+    df_trades = pd.DataFrame(trade_records)
+    analysis = []
+    if not df_trades.empty:
+        for t, grp in df_trades.groupby("ticker"):
+            total_trades = len(grp)
+            win_trades = len(grp[grp["pnl_jpy"] > 0])
+            lose_trades = len(grp[grp["pnl_jpy"] <= 0])
+            win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0.0
+            
+            total_pnl = grp["pnl_jpy"].sum()
+            total_cost = grp["cost_jpy"].sum()
+            
+            gross_profit = grp[grp["pnl_jpy"] > 0]["pnl_jpy"].sum()
+            gross_loss = abs(grp[grp["pnl_jpy"] < 0]["pnl_jpy"].sum())
+            
+            avg_win = gross_profit / win_trades if win_trades > 0 else 0.0
+            avg_lose = gross_loss / lose_trades if lose_trades > 0 else 0.0
+            
+            payoff_ratio = avg_win / avg_lose if avg_lose > 0 else (avg_win if avg_win > 0 else 0.0)
+            roi_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+            
+            analysis.append({
+                "ticker": t,
+                "総売却回数": total_trades,
+                "勝ち回数": win_trades,
+                "負け回数": lose_trades,
+                "勝率 (%)": win_rate,
+                "累計確定損益 (円)": total_pnl,
+                "平均利益 (円)": avg_win,
+                "平均損失 (円)": avg_lose,
+                "ペイオフレシオ": payoff_ratio,
+                "実現リターン (%)": roi_pct
+            })
+    df_trade_analysis = pd.DataFrame(analysis)
+    
     current_holdings = []
     for t, h in holdings.items():
         if h["shares"] > 0:
@@ -607,12 +643,11 @@ def calculate_portfolio_from_transactions(df_raw, fallback_fx=158.0, fee_rate=FI
         current_holdings.append({"ticker": "USD_CASH", "shares": cash_usd, "buy_price": 1.0})
         
     df_current_portfolio = pd.DataFrame(current_holdings)
-    return df_history, df_current_portfolio, df_tx
+    return df_history, df_current_portfolio, df_tx, df_trade_analysis
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def calculate_holdings_history_fast(df_portfolio, fx_usd_jpy):
-    """保有資産一覧形式からの仮想資産推移計算"""
     tickers = [t for t in df_portfolio["ticker"].unique() if not str(t).upper().endswith("CASH") and str(t).upper() not in ["JPY", "USD"]]
     fetch_list = list(set(tickers + ["USDJPY=X"]))
     
@@ -825,9 +860,11 @@ is_transaction_mode = has_date and has_action
 
 df_history = pd.DataFrame()
 df_tx_log = pd.DataFrame()
+df_trade_analysis = pd.DataFrame() # ★ 初期化
 
 if is_transaction_mode:
-    df_history, df_portfolio_raw, df_tx_log = calculate_portfolio_from_transactions(df_raw, fallback_fx=fx_input, fee_rate=FIXED_FEE_RATE)
+    # ★ 戻り値に df_trade_analysis を追加
+    df_history, df_portfolio_raw, df_tx_log, df_trade_analysis = calculate_portfolio_from_transactions(df_raw, fallback_fx=fx_input, fee_rate=FIXED_FEE_RATE)
     df_portfolio = calculate_portfolio_fast(df_portfolio_raw, fx_usd_jpy=fx_input, fee_rate=FIXED_FEE_RATE)
 else:
     df_portfolio = calculate_portfolio_fast(df_raw, fx_usd_jpy=fx_input, fee_rate=FIXED_FEE_RATE)
@@ -948,6 +985,8 @@ tab_titles = [
 ]
 if is_transaction_mode:
     tab_titles.append("📜 【取引履歴 ログ一覧】")
+    # ★ 新規タブ追加
+    tab_titles.append("🏆 【トレード分析・確定損益】")
 
 tabs = st.tabs(tab_titles)
 
@@ -1051,7 +1090,7 @@ with tabs[0]:
             "unrealized_pnl_jpy", "pnl_pct", "realized_pnl_jpy", "usd_jpy"
         ] and not c.endswith("_pnl_pct")]
 
-        # 1. 表示可能なティッカー（カラム名）を抽出し、アルファベット順にソート
+        # 表示可能なティッカー（カラム名）を抽出し、アルファベット順にソート
         valid_tickers = []
         for s_col in stock_cols:
             if (view_hist[s_col] > 0).any() or (f"{s_col}_pnl_pct" in view_hist and not view_hist[f"{s_col}_pnl_pct"].isna().all()):
@@ -1059,13 +1098,13 @@ with tabs[0]:
                 
         valid_tickers.sort() # ティッカーシンボルをA-Z順にソート
         
-        # 2. ソートされたティッカー順に従って、表示用辞書を作成 {銘柄名: カラム名}
+        # ソートされたティッカー順に従って、表示用辞書を作成
         ticker_options = {}
         for s_col in valid_tickers:
             s_name = POPULAR_JP_NAMES.get(s_col, s_col)
             ticker_options[s_name] = s_col
                 
-        # 3. ユーザーインターフェース: マルチセレクトによる銘柄選択 (初期状態は空配列で白紙)
+        # マルチセレクトによる銘柄選択 (初期状態は空配列で白紙)
         selected_names = st.multiselect(
             "📊 比較検証する銘柄を選択（クリックで追加・Backspaceで削除）",
             options=list(ticker_options.keys()),
@@ -1155,7 +1194,7 @@ with tabs[1]:
         st.plotly_chart(fig_sec_pie, use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 3: 保引銘柄 一覧表
+# TAB 3: 保有銘柄 一覧表
 # ----------------------------------------------------
 with tabs[2]:
     st.subheader("保有銘柄の詳細リスト")
@@ -1212,7 +1251,7 @@ with tabs[2]:
     )
 
 # ----------------------------------------------------
-# TAB 4: 取引履歴 ログ一覧（列幅最適化 & メモ見やすく表示）
+# TAB 4: 取引履歴 ログ一覧
 # ----------------------------------------------------
 if is_transaction_mode and len(tabs) > 3:
     with tabs[3]:
@@ -1243,7 +1282,6 @@ if is_transaction_mode and len(tabs) > 3:
         log_df["約定単価"] = log_df["price"].apply(lambda p: f"{p:,.2f}")
         log_df["手数料 (0.4905%)"] = log_df["fee"].apply(lambda f: f"{f:,.2f}" if f > 0 else "0")
         
-        # None や nan を完全に除去
         log_df["メモ・備考"] = log_df.get("memo", "").fillna("").astype(str).replace(["nan", "None", "<NA>"], "")
         
         disp_log = log_df[["取引日", "取引種別", "銘柄", "数量", "約定単価", "手数料 (0.4905%)", "メモ・備考"]]
@@ -1262,6 +1300,86 @@ if is_transaction_mode and len(tabs) > 3:
                 "メモ・備考": st.column_config.TextColumn("メモ・備考", width="large"),
             }
         )
+
+# ----------------------------------------------------
+# TAB 5: トレード分析・確定損益ダッシュボード
+# ----------------------------------------------------
+if is_transaction_mode and len(tabs) > 4:
+    with tabs[4]:
+        st.subheader("🏆 銘柄別 トレード分析ダッシュボード")
+        st.caption("過去の売却（SELL）履歴から、銘柄ごとの勝率、ペイオフレシオ（平均利益÷平均損失）、累計確定損益などを自動集計しています。（※配当は含みません）")
+        
+        if df_trade_analysis.empty:
+            st.info("売却（SELL）の取引記録がないため、分析データがありません。")
+        else:
+            ta_df = df_trade_analysis.copy()
+            meta_records = [get_ticker_meta_info(t) for t in ta_df["ticker"]]
+            meta_df = pd.DataFrame(meta_records)
+            ta_df["銘柄名"] = meta_df["name"]
+            
+            # 列の整理とフォーマット
+            cols = ["銘柄名", "ticker", "総売却回数", "勝率 (%)", "ペイオフレシオ", "累計確定損益 (円)", "実現リターン (%)", "平均利益 (円)", "平均損失 (円)"]
+            ta_df = ta_df[cols]
+            
+            disp_ta = ta_df.copy()
+            if not mask_mode:
+                disp_ta["累計確定損益 (円)"] = ta_df["累計確定損益 (円)"].apply(lambda x: f"{'+' if x>=0 else ''}¥{x:,.0f}")
+                disp_ta["平均利益 (円)"] = ta_df["平均利益 (円)"].apply(lambda x: f"¥{x:,.0f}")
+                disp_ta["平均損失 (円)"] = ta_df["平均損失 (円)"].apply(lambda x: f"¥{x:,.0f}")
+            else:
+                disp_ta["累計確定損益 (円)"] = ta_df["累計確定損益 (円)"].apply(lambda x: "+¥ •••••" if x >= 0 else "-¥ •••••")
+                disp_ta["平均利益 (円)"] = "¥ •••••"
+                disp_ta["平均損失 (円)"] = "¥ •••••"
+                
+            disp_ta["勝率 (%)"] = ta_df["勝率 (%)"].apply(lambda x: f"{x:.1f}%")
+            disp_ta["ペイオフレシオ"] = ta_df["ペイオフレシオ"].apply(lambda x: f"{x:.2f}")
+            disp_ta["実現リターン (%)"] = ta_df["実現リターン (%)"].apply(lambda x: f"{'+' if x>=0 else ''}{x:.1f}%")
+            
+            def color_trade_pnl(val):
+                if str(val).startswith("+") or (isinstance(val, str) and "%" in val and not val.startswith("-") and val != "0.0%"):
+                    return "color: #059669; font-weight: 600;"
+                elif str(val).startswith("-"):
+                    return "color: #dc2626; font-weight: 600;"
+                return ""
+            
+            try:
+                styled_ta = disp_ta.style.map(color_trade_pnl, subset=["勝率 (%)", "ペイオフレシオ", "累計確定損益 (円)", "実現リターン (%)"])
+            except AttributeError:
+                styled_ta = disp_ta.style.applymap(color_trade_pnl, subset=["勝率 (%)", "ペイオフレシオ", "累計確定損益 (円)", "実現リターン (%)"])
+                
+            st.dataframe(
+                styled_ta,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "銘柄名": st.column_config.TextColumn("銘柄名", width="medium"),
+                    "ticker": st.column_config.TextColumn("ティッカー", width="small"),
+                    "総売却回数": st.column_config.TextColumn("トレード回数", width="small"),
+                    "ペイオフレシオ": st.column_config.TextColumn("ペイオフレシオ", help="平均利益 ÷ 平均損失"),
+                }
+            )
+            
+            # --- 投資の全体期待値 (Expectancy) の計算と表示 ---
+            st.markdown("---")
+            total_sell_count = ta_df["総売却回数"].sum()
+            total_wins = df_trade_analysis["勝ち回数"].sum()
+            total_losses = df_trade_analysis["負け回数"].sum()
+            overall_win_rate = (total_wins / total_sell_count * 100) if total_sell_count > 0 else 0.0
+            
+            overall_gross_profit = df_trade_analysis["平均利益 (円)"].multiply(df_trade_analysis["勝ち回数"]).sum()
+            overall_gross_loss = df_trade_analysis["平均損失 (円)"].multiply(df_trade_analysis["負け回数"]).sum()
+            
+            overall_avg_win = overall_gross_profit / total_wins if total_wins > 0 else 0.0
+            overall_avg_loss = overall_gross_loss / total_losses if total_losses > 0 else 0.0
+            overall_payoff = overall_avg_win / overall_avg_loss if overall_avg_loss > 0 else (overall_avg_win if overall_avg_win > 0 else 0.0)
+            
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            ec1.metric("全体の勝率", f"{overall_win_rate:.1f}%", f"{total_wins}勝 / {total_losses}敗" if total_sell_count > 0 else "")
+            ec2.metric("全体のペイオフレシオ", f"{overall_payoff:.2f}", "平均利益 ÷ 平均損失")
+            ec3.metric("平均利益 (勝ちトレード)", f"¥{overall_avg_win:,.0f}" if not mask_mode else "¥ •••••")
+            ec4.metric("平均損失 (負けトレード)", f"¥{overall_avg_loss:,.0f}" if not mask_mode else "¥ •••••")
+            
+            st.caption("💡 **論理的な優位性**: ペイオフレシオ（損益比率）が **2.0** 以上確保できていれば、勝率が **33%** でも理論上は利益が残ります。損失を小さく切り（平均損失の抑制）、非線形な伸びに乗る（平均利益の拡大）という戦略が機能しているか、この指標で客観的に検証可能です。")
 
 st.markdown("---")
 st.caption("💡 スプレッドシートを更新すれば、この画面にも自動で最新データが反映されます。")
