@@ -1051,14 +1051,21 @@ with tabs[0]:
             "unrealized_pnl_jpy", "pnl_pct", "realized_pnl_jpy", "usd_jpy"
         ] and not c.endswith("_pnl_pct")]
 
-        # 表示可能な銘柄の辞書を作成 {銘柄名: カラム名}
-        ticker_options = {}
+        # 1. 表示可能なティッカー（カラム名）を抽出し、アルファベット順にソート
+        valid_tickers = []
         for s_col in stock_cols:
             if (view_hist[s_col] > 0).any() or (f"{s_col}_pnl_pct" in view_hist and not view_hist[f"{s_col}_pnl_pct"].isna().all()):
-                s_name = POPULAR_JP_NAMES.get(s_col, s_col)
-                ticker_options[s_name] = s_col
+                valid_tickers.append(s_col)
                 
-        # ユーザーインターフェース: マルチセレクトによる銘柄選択 (初期状態は空配列で白紙)
+        valid_tickers.sort() # ティッカーシンボルをA-Z順にソート
+        
+        # 2. ソートされたティッカー順に従って、表示用辞書を作成 {銘柄名: カラム名}
+        ticker_options = {}
+        for s_col in valid_tickers:
+            s_name = POPULAR_JP_NAMES.get(s_col, s_col)
+            ticker_options[s_name] = s_col
+                
+        # 3. ユーザーインターフェース: マルチセレクトによる銘柄選択 (初期状態は空配列で白紙)
         selected_names = st.multiselect(
             "📊 比較検証する銘柄を選択（クリックで追加・Backspaceで削除）",
             options=list(ticker_options.keys()),
@@ -1148,7 +1155,7 @@ with tabs[1]:
         st.plotly_chart(fig_sec_pie, use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 3: 保有銘柄 一覧表
+# TAB 3: 保引銘柄 一覧表
 # ----------------------------------------------------
 with tabs[2]:
     st.subheader("保有銘柄の詳細リスト")
